@@ -41,6 +41,8 @@ interface SceneProps {
   descendSignal?: number
   /** +1 zooms in, -1 zooms out; a counter so repeat clicks always register */
   zoomNudge?: number
+  /** true while the descent wash is playing — dive the camera toward the pin */
+  diving?: boolean
   onModeChange?: (mode: 'globe' | 'ground') => void
   onGroundState?: (s: GroundState) => void
 }
@@ -198,6 +200,30 @@ function GroundCamera({
   return null
 }
 
+/**
+ * Flies the globe camera toward the pin while the descent wash plays.
+ *
+ * Zajno's zoom-continuity point: the transition should carry you between
+ * destinations, not blink you there. The wash hides the actual scene swap,
+ * but its first ~600ms are still translucent — so the camera really does
+ * accelerate at the pin underneath. That's what makes the arrival read as
+ * having travelled somewhere.
+ */
+function DiveIn({ target }: { target: { lat: number; lon: number } }) {
+  const { camera } = useThree()
+  const dest = useRef(new THREE.Vector3())
+
+  useFrame((_, delta) => {
+    const [x, y, z] = latLonToVec3(target.lat, target.lon, 1.12)
+    dest.current.set(x, y, z)
+    // Accelerating, not linear — the whole point of easing.
+    camera.position.lerp(dest.current, 1 - Math.pow(0.02, delta))
+    camera.lookAt(0, 0, 0)
+  })
+
+  return null
+}
+
 /** Applies the zoom buttons' nudges to the camera. */
 function ZoomControl({ nudge }: { nudge: number }) {
   const { camera } = useThree()
@@ -242,6 +268,7 @@ export function Scene({
   allowGround,
   descendSignal = 0,
   zoomNudge = 0,
+  diving = false,
   onModeChange,
   onGroundState,
 }: SceneProps) {
@@ -353,6 +380,7 @@ export function Scene({
       )}
 
       {!isGround && <ZoomControl nudge={zoomNudge} />}
+      {!isGround && diving && <DiveIn target={marker} />}
       <ModeWatcher enabled={allowGround} mode={mode} onChange={setMode} />
       <GroundCamera active={isGround} sunAzimuth={sunAzimuth} sunAltitude={sunAltitude} />
 

@@ -10,6 +10,7 @@
 import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import { Scene, type GroundState } from './components/Scene'
+import { Descent, type Phase as DescentPhase } from './components/Descent'
 import { PlanetBar } from './components/PlanetBar'
 import { Stat, SkyDome, DayBand, TimeRow } from './components/Readout'
 import { SunOrb, FlowNumber, PhasePill, TimeScrubber } from './components/adopted'
@@ -99,6 +100,10 @@ export default function App() {
   // camera. A counter rather than a value so repeated clicks always register.
   const [zoomNudge, setZoomNudge] = useState(0)
   const [copied, setCopied] = useState(false)
+  const [descentPhase, setDescentPhase] = useState<DescentPhase>('idle')
+  // Mirror of groundState.status for the descent timer to poll — reading state
+  // directly inside an interval would capture a stale closure.
+  const readyRef = useRef<GroundState['status']>('idle')
 
   const isEarth = planet.id === 'earth'
 
@@ -197,10 +202,60 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [coord.lat, coord.lon, dayKey])
 
+  useEffect(() => {
+    readyRef.current = groundState.status
+  }, [groundState.status])
+
   const sky = useMemo(
     () => (weather ? sliceAt(weather, date) : null),
     [weather, date],
   )
+
+  // Hold the descent wash open until the ground scene has something to show.
+  // Floor of 1.15s so the animation always completes rather than snapping;
+  // ceiling of 9s so a stuck fetch can't leave the user staring at a wash.
+  useEffect(() => {
+    if (descentPhase !== 'descending') return
+
+    // groundState can still say 'ready' from a PREVIOUS visit at the moment
+    // the descent starts, which closed the wash on frame one and revealed the
+    // black loading scene. Only accept a ready that arrives after we started
+    // descending.
+    const started = Date.now()
+    let settled = false
+
+    const close = () => {
+      if (settled) return
+      settled = true
+      const elapsed = Date.now() - started
+      // Floor so the animation always completes rather than snapping shut.
+      window.setTimeout(() => setDescentPhase('idle'), Math.max(0, 1150 - elapsed))
+    }
+
+    // Poll rather than react to the value directly: the transition through
+    // loading -> ready is what we care about, not the value at mount.
+    let sawLoading = groundState.status === 'loading'
+    const id = window.setInterval(() => {
+      if (sawLoading && (readyRef.current === 'ready' || readyRef.current === 'error')) {
+        clearInterval(id)
+        close()
+      } else if (readyRef.current === 'loading') {
+        sawLoading = true
+      }
+    }, 80)
+
+    // Ceiling so a stuck fetch can't trap the user behind the wash.
+    const bail = window.setTimeout(() => {
+      clearInterval(id)
+      close()
+    }, 9000)
+
+    return () => {
+      clearInterval(id)
+      clearTimeout(bail)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [descentPhase])
 
   // The next thing the sun is going to do — feeds the phase pill's expansion.
   const nextEvent = useMemo(() => {
@@ -391,12 +446,24 @@ export default function App() {
           hasAtmosphere={planet.id !== 'moon' && planet.id !== 'mercury'}
           autoRotate={false}
           zoomNudge={zoomNudge}
+          diving={descentPhase === 'descending'}
           sunAltitude={alien ? alien.altitude : sun.altitude}
           sunAzimuth={alien ? alien.azimuth : sun.azimuth}
           skyTint={phase.tint}
           allowGround={isEarth}
           descendSignal={descend}
-          onModeChange={setViewMode}
+          onModeChange={(m) => {
+            // A wheel-driven crossing fires the wash too, so the transition
+            // looks the same however you got there.
+            if (m !== viewMode && descentPhase === 'idle') {
+              const down = m === 'ground'
+              setDescentPhase(down ? 'descending' : 'ascending')
+              // Descending is closed by the ready-effect above; ascending has
+              // nothing to wait for.
+              if (!down) window.setTimeout(() => setDescentPhase('idle'), 1250)
+            }
+            setViewMode(m)
+          }}
           onGroundState={setGroundState}
         />
       </div>
@@ -458,7 +525,21 @@ export default function App() {
 
             {isEarth && (
               <button
-                onClick={() => setDescend((d) => d + 1)}
+                onClick={() => {
+                  // Play the wash and swap the scene at its peak, so the two
+                  // scenes never hard-cut in front of the viewer.
+                  //
+                  // Going DOWN the wash is held open until the terrain reports
+                  // ready (see the effect below) — a fixed timer retracted it
+                  // onto an empty black scene while tiles were still loading.
+                  // Coming UP there is nothing to wait for, so a timer is fine.
+                  const goingDown = viewMode !== 'ground'
+                  setDescentPhase(goingDown ? 'descending' : 'ascending')
+                  window.setTimeout(() => setDescend((d) => d + 1), 620)
+                  if (!goingDown) {
+                    window.setTimeout(() => setDescentPhase('idle'), 1250)
+                  }
+                }}
                 className="px-3 py-2 r-inner press text-[11px] w-medium border panel text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
                 title={
                   viewMode === 'ground'
@@ -945,6 +1026,14 @@ export default function App() {
           </AnimatePresence>
         </div>
       </aside>
+
+      {/* The descent. Sits above the canvas so it can hide the scene swap,
+          but below the readout panels so the numbers never blink. */}
+      <Descent
+        phase={descentPhase}
+        placeName={label}
+        skyTint={phase.tint}
+      />
 
       {/* ---------------- ground-mode status ----------------
           When you're standing on the surface, say where the pixels came from
