@@ -1,0 +1,10 @@
+# The HTML entry point must never be served stale: it is the only file that
+# names the current hashed bundles. Hashed assets are immutable by definition.
+/
+  Cache-Control: no-store, must-revalidate
+/index.html
+  Cache-Control: no-store, must-revalidate
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+/textures/*
+  Cache-Control: public, max-age=604800

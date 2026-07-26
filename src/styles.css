@@ -1,0 +1,215 @@
+@import 'tailwindcss' source(none);
+
+/*
+  The smoothui install dropped 32 component folders in. Four are adapted and
+  used (via components/adopted.tsx); the rest are unreferenced. JS tree-shaking
+  already drops them, but Tailwind v4 scans source by default and was emitting
+  utilities for class names in dead files — ~6KB gzipped of CSS for components
+  that never render. Scope the scan to what we actually ship.
+*/
+@source '../index.html';
+@source './App.tsx';
+@source './main.tsx';
+@source './components/Globe.tsx';
+@source './components/Scene.tsx';
+@source './components/PlanetBar.tsx';
+@source './components/Readout.tsx';
+@source './components/adopted.tsx';
+@source './components/smoothui/siri-orb';
+@source './components/smoothui/scrubber';
+
+/*
+  geography — the visual system.
+
+  The register here is instrument, not magazine. This thing reports real
+  numbers about real light, so it should look like something you'd trust with
+  a measurement: dark field, precise type, restrained colour used only where
+  it carries information. The one warm accent is the sun, and it's earned.
+*/
+
+@theme {
+  /* The field. Near-black but blue-shifted — a night sky, not a void. */
+  --color-void: oklch(0.14 0.012 265);
+  --color-deep: oklch(0.18 0.016 265);
+  --color-panel: oklch(0.22 0.018 265);
+  --color-raised: oklch(0.27 0.02 265);
+  --color-line: oklch(0.32 0.02 265);
+  --color-line-bright: oklch(0.42 0.024 265);
+
+  /* Text ladder. */
+  --color-ink: oklch(0.97 0.004 265);
+  --color-ink-soft: oklch(0.78 0.012 265);
+  --color-ink-mute: oklch(0.62 0.014 265);
+  --color-ink-faint: oklch(0.48 0.016 265);
+
+  /* Light states — these carry meaning, so they're consistent everywhere. */
+  --color-sun: oklch(0.83 0.16 78);
+  --color-golden: oklch(0.78 0.15 62);
+  --color-civil: oklch(0.66 0.13 38);
+  --color-blue-hour: oklch(0.58 0.12 268);
+  --color-nautical: oklch(0.45 0.11 272);
+  --color-astro: oklch(0.34 0.08 276);
+  --color-night: oklch(0.26 0.05 278);
+  --color-day: oklch(0.76 0.13 235);
+
+  --font-display: 'Instrument Serif', ui-serif, Georgia, serif;
+  --font-sans: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+
+  /* One shared curve, agreed on by every design pack we consulted. */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+@layer base {
+  * {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    margin: 0;
+  }
+
+  body {
+    background: var(--color-void);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+    overscroll-behavior: none;
+  }
+
+  /* Numbers that change should never reflow the layout around them. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum';
+  }
+
+  ::selection {
+    background: oklch(0.83 0.16 78 / 0.28);
+  }
+
+  /* Focus rings: visible for keyboard, absent for mouse. */
+  :focus-visible {
+    outline: 2px solid var(--color-sun);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  input[type='range'] {
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+    cursor: grab;
+  }
+  input[type='range']:active {
+    cursor: grabbing;
+  }
+  input[type='range']::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--color-ink);
+    border: 2px solid var(--color-void);
+    box-shadow:
+      0 1px 3px oklch(0 0 0 / 0.5),
+      0 0 0 1px oklch(1 0 0 / 0.12);
+    /* 0.08s: this is a small thing, so it moves on the fast tier. */
+    transition: transform 0.08s var(--ease-out);
+  }
+  input[type='range']::-webkit-slider-thumb:hover {
+    transform: scale(1.12);
+  }
+  input[type='range']:active::-webkit-slider-thumb {
+    transform: scale(0.96);
+  }
+  input[type='range']::-moz-range-thumb {
+    width: 18px;
+    height: 18px;
+    border-radius: 50%;
+    background: var(--color-ink);
+    border: 2px solid var(--color-void);
+    cursor: grab;
+  }
+}
+
+@layer utilities {
+  .panel {
+    background: oklch(0.18 0.016 265 / 0.82);
+    backdrop-filter: blur(20px) saturate(1.4);
+    -webkit-backdrop-filter: blur(20px) saturate(1.4);
+    border: 1px solid oklch(0.42 0.024 265 / 0.34);
+  }
+
+  /* Concentric radius: an inner element inside a padded parent should have
+     radius = parent radius − padding, or the corners fight each other. */
+  .r-outer {
+    border-radius: 16px;
+  }
+  .r-inner {
+    border-radius: 10px;
+  }
+
+  .hairline {
+    border-color: oklch(0.42 0.024 265 / 0.28);
+  }
+
+  .press {
+    transition:
+      transform 0.08s var(--ease-out),
+      background-color 0.12s var(--ease-out),
+      border-color 0.12s var(--ease-out);
+  }
+  .press:active {
+    transform: scale(0.96);
+  }
+
+  /* Weight shifts paired with optical size, so the advance width holds and
+     text doesn't jitter when it becomes active. */
+  .w-normal {
+    font-variation-settings: 'wght' 400, 'opsz' 14;
+  }
+  .w-medium {
+    font-variation-settings: 'wght' 450, 'opsz' 15;
+  }
+  .w-semi {
+    font-variation-settings: 'wght' 550, 'opsz' 20;
+  }
+  .w-bold {
+    font-variation-settings: 'wght' 700, 'opsz' 25;
+  }
+  .weight-shift {
+    transition: font-variation-settings 0.16s var(--ease-out);
+  }
+
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-bright) transparent;
+  }
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    background: var(--color-line-bright);
+    border-radius: 3px;
+  }
+  .scrollbar-thin::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

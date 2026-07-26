@@ -1,0 +1,6 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "geography-globe",
+  "compatibility_date": "2026-07-01",
+  "assets": { "directory": "./dist" }
+}
