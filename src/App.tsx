@@ -101,6 +101,10 @@ export default function App() {
   const [zoomNudge, setZoomNudge] = useState(0)
   const [copied, setCopied] = useState(false)
   const [descentPhase, setDescentPhase] = useState<DescentPhase>('idle')
+  // Where the viewer is looking in ground mode. Free-look without a heading
+  // readout is disorienting — you lose track of which way is north and whether
+  // the bright patch you're looking at is actually the sun.
+  const [look, setLook] = useState({ yaw: 0, pitch: 0 })
   // Mirror of groundState.status for the descent timer to poll — reading state
   // directly inside an interval would capture a stale closure.
   const readyRef = useRef<GroundState['status']>('idle')
@@ -465,6 +469,7 @@ export default function App() {
             setViewMode(m)
           }}
           onGroundState={setGroundState}
+          onLook={setLook}
         />
       </div>
 
@@ -1035,6 +1040,55 @@ export default function App() {
         skyTint={phase.tint}
       />
 
+      {/* Where you're looking. Only in ground mode, where the camera can
+          point anywhere — including straight up, which is the whole reason
+          this control scheme exists. */}
+      <AnimatePresence>
+        {viewMode === 'ground' && groundState.status === 'ready' && (
+          <motion.div
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 6, transition: exit.moderate }}
+            transition={spring.moderate}
+            className="absolute left-1/2 -translate-x-1/2 top-[86px] pointer-events-none z-10"
+          >
+            <div className="panel r-outer px-4 py-2 flex items-center gap-4 text-[11px]">
+              <span className="tabular w-medium">
+                {compass(look.yaw)}
+                <span className="text-[var(--color-ink-faint)] ml-1.5">
+                  {look.yaw.toFixed(0)}°
+                </span>
+              </span>
+              <span className="w-px h-3.5 bg-white/12" />
+              <span className="tabular text-[var(--color-ink-mute)]">
+                {look.pitch > 0 ? '+' : ''}
+                {look.pitch.toFixed(0)}°
+                <span className="text-[var(--color-ink-faint)] ml-1">
+                  {look.pitch > 55
+                    ? 'looking up'
+                    : look.pitch < -20
+                      ? 'looking down'
+                      : 'horizon'}
+                </span>
+              </span>
+              {/* Tell you where the sun is relative to where you're facing —
+                  the one piece of navigation that actually matters here. */}
+              {sun.altitude > -0.833 && (
+                <>
+                  <span className="w-px h-3.5 bg-white/12" />
+                  <span
+                    className="tabular w-medium"
+                    style={{ color: phase.tint }}
+                  >
+                    {sunRelative(look.yaw, sun.azimuth)}
+                  </span>
+                </>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* ---------------- ground-mode status ----------------
           When you're standing on the surface, say where the pixels came from
           and how trustworthy the heights are. */}
@@ -1481,6 +1535,20 @@ function Note({ children }: { children: React.ReactNode }) {
       {children}
     </p>
   )
+}
+
+/**
+ * Which way the sun is from where you're facing. "Sun ahead" beats making the
+ * user subtract two bearings in their head.
+ */
+function sunRelative(facing: number, sunAz: number) {
+  let d = ((sunAz - facing + 540) % 360) - 180
+  const a = Math.abs(d)
+  if (a < 18) return 'Sun ahead'
+  if (a > 162) return 'Sun behind you'
+  const side = d > 0 ? 'right' : 'left'
+  if (a < 60) return `Sun ${Math.round(a)}° ${side}`
+  return `Sun to your ${side}`
 }
 
 const compass = (az: number) => {

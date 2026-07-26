@@ -13,6 +13,7 @@ import { OrbitControls, Stars } from '@react-three/drei'
 import * as THREE from 'three'
 import { Globe } from './Globe'
 import { GroundScene, loadGround, SCENE_RADIUS, type GroundData } from './Ground'
+import { LookControls } from './LookControls'
 import { latLonToVec3 } from '../lib/solar'
 
 /** Camera distance (in globe radii) at which we switch to the ground scene. */
@@ -45,6 +46,8 @@ interface SceneProps {
   diving?: boolean
   onModeChange?: (mode: 'globe' | 'ground') => void
   onGroundState?: (s: GroundState) => void
+  /** where the viewer is looking in ground mode, for the on-screen compass */
+  onLook?: (s: { yaw: number; pitch: number }) => void
 }
 
 export type GroundState =
@@ -154,34 +157,30 @@ function GroundCamera({
   active,
   sunAzimuth,
   sunAltitude,
+  fovRef,
 }: {
   active: boolean
   sunAzimuth: number
   sunAltitude: number
+  fovRef: React.MutableRefObject<number>
 }) {
   const { camera } = useThree()
 
   useEffect(() => {
     if (!active) return
 
-    // Stand on the opposite side of the pin from the sun and look back toward
-    // it: sun in the sky ahead, shadows stretching toward the viewer.
+    // Stand back from the pin on the far side from the sun, at a height that
+    // reads as a low vantage point rather than a drone. The camera no longer
+    // orbits — LookControls rotates it in place from here — so this is a
+    // standing position, not an orbit radius.
     const az = (sunAzimuth * Math.PI) / 180
-    const back = 560
-    // Low camera, look UP toward the horizon. The first attempt sat at 210m
-    // aiming down at the ground, which framed the terrain but pushed the sun
-    // clean out of the top of the shot — the one thing you came here to see.
-    camera.position.set(-back * Math.sin(az), 130, back * Math.cos(az))
-    // Aim at the sun's own altitude, so it lands in frame whatever the hour.
-    // A fixed pitch put it above the top of the shot every afternoon.
-    const sunH = 130 + Math.tan((Math.max(4, sunAltitude) * Math.PI) / 180) * back * 0.82
-    camera.lookAt(-200 * Math.sin(az), Math.min(sunH, 900), 200 * Math.cos(az))
+    const back = 420
+    camera.position.set(-back * Math.sin(az), 95, back * Math.cos(az))
     camera.near = 1
     camera.far = SCENE_RADIUS * 12
+    ;(camera as THREE.PerspectiveCamera).fov = 55
+    fovRef.current = 55
     camera.updateProjectionMatrix()
-    // Only on entering ground mode — re-aiming while the user drags would
-    // fight them for control.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, camera])
 
@@ -191,11 +190,47 @@ function GroundCamera({
     // clear of the descend threshold so we don't immediately fall back down.
     camera.near = 0.1
     camera.far = 100
+    ;(camera as THREE.PerspectiveCamera).fov = 36
     if (camera.position.length() < 3) {
       camera.position.normalize().multiplyScalar(4.1)
     }
     camera.updateProjectionMatrix()
   }, [active, camera])
+
+  return null
+}
+
+/**
+ * Wheel zoom for ground mode.
+ *
+ * Standing still, "zoom" can't mean moving closer — that would walk you across
+ * the terrain. It means narrowing the field of view, the way binoculars do.
+ * Also keeps the pointer-drag sensitivity honest: LookControls scales its
+ * response by fov, so a zoomed-in view turns proportionally slower.
+ */
+function FovZoom({ fovRef }: { fovRef: React.MutableRefObject<number> }) {
+  const { camera, gl } = useThree()
+  const target = useRef(fovRef.current)
+
+  useEffect(() => {
+    const el = gl.domElement
+    const onWheel = (e: WheelEvent) => {
+      e.preventDefault()
+      // 20° is a tight telephoto; 78° is a wide field that still avoids the
+      // fisheye distortion you get past ~85.
+      target.current = Math.max(20, Math.min(78, target.current + e.deltaY * 0.045))
+    }
+    el.addEventListener('wheel', onWheel, { passive: false })
+    return () => el.removeEventListener('wheel', onWheel)
+  }, [gl])
+
+  useFrame((_, delta) => {
+    const cam = camera as THREE.PerspectiveCamera
+    if (Math.abs(cam.fov - target.current) < 0.01) return
+    cam.fov = THREE.MathUtils.damp(cam.fov, target.current, 10, delta)
+    fovRef.current = cam.fov
+    cam.updateProjectionMatrix()
+  })
 
   return null
 }
@@ -271,8 +306,12 @@ export function Scene({
   diving = false,
   onModeChange,
   onGroundState,
+  onLook,
 }: SceneProps) {
   const controlsRef = useRef<any>(null)
+  // Field of view is the ground-mode zoom, and LookControls reads it to scale
+  // drag sensitivity.
+  const fovRef = useRef(55)
   const [mode, setMode] = useState<'globe' | 'ground'>(() =>
     typeof window !== 'undefined' &&
     new URLSearchParams(window.location.search).has('ground')
@@ -382,25 +421,45 @@ export function Scene({
       {!isGround && <ZoomControl nudge={zoomNudge} />}
       {!isGround && diving && <DiveIn target={marker} />}
       <ModeWatcher enabled={allowGround} mode={mode} onChange={setMode} />
-      <GroundCamera active={isGround} sunAzimuth={sunAzimuth} sunAltitude={sunAltitude} />
+      <GroundCamera active={isGround} sunAzimuth={sunAzimuth} sunAltitude={sunAltitude} fovRef={fovRef} />
 
       {!isGround && <GlobeCamera target={marker} enabled={autoRotate} controls={controlsRef} />}
 
-      <OrbitControls
-        ref={controlsRef}
-        enablePan={false}
-        enableDamping
-        dampingFactor={0.06}
-        rotateSpeed={0.45}
-        zoomSpeed={0.7}
-        // In ground mode the units are metres, so the limits change entirely.
-        minDistance={isGround ? 40 : 1.5}
-        maxDistance={isGround ? SCENE_RADIUS * 3 : 7}
-        // Don't let the camera go under the terrain.
-        maxPolarAngle={isGround ? Math.PI * 0.495 : Math.PI}
-        target={isGround ? [0, 30, 0] : [0, 0, 0]}
-        enabled={!autoRotate || isGround}
-      />
+      {/* Two different control models, because the two modes are two
+          different verbs.
+
+          GLOBE — you're inspecting an object, so orbit around it.
+
+          GROUND — you're standing in a place, so look around from it.
+          OrbitControls can't do this: it always aims at a fixed target, which
+          means the view can never tilt above the horizon. Raising
+          maxPolarAngle only buries the camera underground, still looking down.
+          In an app about where the sun is, being unable to look up at the sky
+          is close to the worst possible limitation. */}
+      {isGround ? (
+        <LookControls
+          active
+          initialYaw={sunAzimuth}
+          initialPitch={Math.max(6, Math.min(50, sunAltitude * 0.75))}
+          resetKey={`${marker.lat.toFixed(3)},${marker.lon.toFixed(3)}`}
+          fovRef={fovRef}
+          onChange={onLook}
+        />
+      ) : (
+        <OrbitControls
+          ref={controlsRef}
+          enablePan={false}
+          enableDamping
+          dampingFactor={0.06}
+          rotateSpeed={0.45}
+          zoomSpeed={0.7}
+          minDistance={1.5}
+          maxDistance={7}
+          target={[0, 0, 0]}
+          enabled={!autoRotate}
+        />
+      )}
+      {isGround && <FovZoom fovRef={fovRef} />}
     </Canvas>
   )
 }
