@@ -3,3 +3,4 @@ dist/
 .wrangler/
 *.log
 .DS_Store
+worker/font-data.json.bak

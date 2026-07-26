@@ -308,6 +308,290 @@ function GroundPin({ lit }: { lit: boolean }) {
 }
 
 /* ------------------------------------------------------------------ */
+/* A sky you can actually see the sun in                               */
+/* ------------------------------------------------------------------ */
+
+/**
+ * The dome.
+ *
+ * Ground mode used to render into a black void: a DirectionalLight with no
+ * visible source, no horizon, and no sky. You could see shadows but had to
+ * guess what was casting them, which is the opposite of the point of this app.
+ *
+ * This is an inside-out sphere whose gradient is driven by the same sun
+ * altitude everything else uses — so the sky goes orange at golden hour and
+ * deep blue at night because the sun is low, not because someone picked a
+ * colour.
+ */
+const skyVertex = /* glsl */ `
+  varying vec3 vWorldPos;
+  void main() {
+    vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`
+
+const skyFragment = /* glsl */ `
+  uniform vec3  sunDir;
+  uniform float sunAlt;      // degrees
+  uniform vec3  zenith;
+  uniform vec3  horizonCol;
+  uniform vec3  groundCol;
+  varying vec3 vWorldPos;
+
+  void main() {
+    vec3 dir = normalize(vWorldPos);
+    float h = dir.y;                       // -1 down, +1 up
+
+    // Sky above, dark haze below the horizon line.
+    vec3 col = mix(horizonCol, zenith, pow(max(h, 0.0), 0.55));
+    col = mix(groundCol, col, smoothstep(-0.06, 0.02, h));
+
+    // Warm bloom around the sun itself, strongest when it is near the horizon
+    // — that is when the light travels through the most atmosphere.
+    float d = max(dot(dir, sunDir), 0.0);
+    float lowSun = 1.0 - smoothstep(0.0, 35.0, sunAlt);
+    col += vec3(1.0, 0.55, 0.22) * pow(d, 6.0) * (0.35 + lowSun * 0.75);
+    col += vec3(1.0, 0.85, 0.6)  * pow(d, 220.0) * 1.4;
+
+    gl_FragColor = vec4(col, 1.0);
+    #include <colorspace_fragment>
+  }
+`
+
+function Sky({ altitude, azimuth }: { altitude: number; azimuth: number }) {
+  const matRef = useRef<THREE.ShaderMaterial>(null)
+
+  const sunDir = useMemo(() => {
+    const alt = (altitude * Math.PI) / 180
+    const az = (azimuth * Math.PI) / 180
+    return new THREE.Vector3(
+      Math.cos(alt) * Math.sin(az),
+      Math.sin(alt),
+      -Math.cos(alt) * Math.cos(az),
+    ).normalize()
+  }, [altitude, azimuth])
+
+  // Palette interpolated on altitude, matching the phase colours used
+  // everywhere else in the app.
+  const { zenith, horizonCol, groundCol } = useMemo(() => {
+    const a = altitude
+    const lerp = (x: number[], y: number[], t: number) =>
+      new THREE.Color(
+        x[0] + (y[0] - x[0]) * t,
+        x[1] + (y[1] - x[1]) * t,
+        x[2] + (y[2] - x[2]) * t,
+      )
+    if (a > 18) {
+      const t = Math.min(1, (a - 18) / 45)
+      return {
+        zenith: lerp([0.13, 0.3, 0.62], [0.09, 0.29, 0.72], t),
+        horizonCol: lerp([0.55, 0.68, 0.86], [0.62, 0.76, 0.93], t),
+        groundCol: new THREE.Color(0.05, 0.06, 0.09),
+      }
+    }
+    if (a > 0) {
+      const t = a / 18 // 0 at horizon, 1 at 18°
+      return {
+        zenith: lerp([0.1, 0.16, 0.36], [0.13, 0.3, 0.62], t),
+        horizonCol: lerp([0.95, 0.45, 0.18], [0.55, 0.68, 0.86], t),
+        groundCol: new THREE.Color(0.04, 0.04, 0.06),
+      }
+    }
+    // Below the horizon: twilight bleeding into night.
+    const t = Math.min(1, -a / 18)
+    return {
+      zenith: lerp([0.1, 0.16, 0.36], [0.02, 0.03, 0.08], t),
+      horizonCol: lerp([0.72, 0.33, 0.16], [0.05, 0.07, 0.16], t),
+      groundCol: new THREE.Color(0.015, 0.02, 0.035),
+    }
+  }, [altitude])
+
+  const uniforms = useMemo(
+    () => ({
+      sunDir: { value: sunDir.clone() },
+      sunAlt: { value: altitude },
+      zenith: { value: zenith.clone() },
+      horizonCol: { value: horizonCol.clone() },
+      groundCol: { value: groundCol.clone() },
+    }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  )
+
+  useFrame(() => {
+    const u = matRef.current?.uniforms
+    if (!u) return
+    u.sunDir.value.copy(sunDir)
+    u.sunAlt.value = altitude
+    u.zenith.value.copy(zenith)
+    u.horizonCol.value.copy(horizonCol)
+    u.groundCol.value.copy(groundCol)
+  })
+
+  return (
+    <mesh scale={[-1, 1, 1]} renderOrder={-1}>
+      <sphereGeometry args={[SCENE_RADIUS * 7, 32, 24]} />
+      <shaderMaterial
+        ref={matRef}
+        vertexShader={skyVertex}
+        fragmentShader={skyFragment}
+        uniforms={uniforms}
+        depthWrite={false}
+        side={THREE.BackSide}
+      />
+    </mesh>
+  )
+}
+
+/**
+ * The sun as a visible disc.
+ *
+ * Placed at its true altitude and bearing, at the correct angular size
+ * (0.53° from Earth). Below the horizon it is not drawn at all — which is
+ * itself the information: if you can't find the sun, it has set.
+ */
+function SunDisc({ altitude, azimuth }: { altitude: number; azimuth: number }) {
+  const DIST = SCENE_RADIUS * 5
+  const below = altitude < -0.833
+
+  const pos = useMemo(() => {
+    const alt = (altitude * Math.PI) / 180
+    const az = (azimuth * Math.PI) / 180
+    return new THREE.Vector3(
+      DIST * Math.cos(alt) * Math.sin(az),
+      DIST * Math.sin(alt),
+      -DIST * Math.cos(alt) * Math.cos(az),
+    )
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [altitude, azimuth])
+
+  // True angular size: 0.53°. Rendered a little larger so it reads at a
+  // glance — an honest 0.53° disc is only a few pixels across.
+  const radius = DIST * Math.tan((1.6 * Math.PI) / 360)
+
+  const glow = useMemo(() => {
+    const size = 128
+    const c = document.createElement('canvas')
+    c.width = c.height = size
+    const ctx = c.getContext('2d')!
+    const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2)
+    g.addColorStop(0, 'rgba(255,247,225,0.95)')
+    g.addColorStop(0.15, 'rgba(255,226,160,0.45)')
+    g.addColorStop(0.4, 'rgba(255,190,110,0.14)')
+    g.addColorStop(1, 'rgba(255,170,90,0)')
+    ctx.fillStyle = g
+    ctx.fillRect(0, 0, size, size)
+    const t = new THREE.CanvasTexture(c)
+    t.colorSpace = THREE.SRGBColorSpace
+    return t
+  }, [])
+
+  if (below) return null
+
+  // Low sun reddens, high sun runs white.
+  const warm = Math.max(0, Math.min(1, altitude / 25))
+  const disc = new THREE.Color().setHSL(
+    0.09 - warm * 0.02,
+    0.85 - warm * 0.55,
+    0.62 + warm * 0.33,
+  )
+
+  return (
+    <group position={pos}>
+      <mesh>
+        <sphereGeometry args={[radius, 24, 24]} />
+        <meshBasicMaterial color={disc} toneMapped={false} />
+      </mesh>
+      <sprite scale={[radius * 14, radius * 14, 1]}>
+        <spriteMaterial
+          map={glow}
+          transparent
+          opacity={0.9}
+          blending={THREE.AdditiveBlending}
+          depthWrite={false}
+          toneMapped={false}
+        />
+      </sprite>
+    </group>
+  )
+}
+
+/**
+ * Cardinal markers on the ground plane.
+ *
+ * Without these there is no way to tell which way you are facing, so "the sun
+ * is at bearing 262°" is unusable information. N/E/S/W sit at the scene edge
+ * and always face the camera.
+ */
+function Compass({ altitude, azimuth }: { altitude: number; azimuth: number }) {
+  const r = SCENE_RADIUS * 0.92
+  const marks: [string, number][] = [
+    ['N', 0],
+    ['E', 90],
+    ['S', 180],
+    ['W', 270],
+  ]
+
+  const texts = useMemo(() => {
+    return marks.map(([label, bearing]) => {
+      const c = document.createElement('canvas')
+      c.width = c.height = 128
+      const ctx = c.getContext('2d')!
+      ctx.clearRect(0, 0, 128, 128)
+      ctx.fillStyle = 'rgba(255,255,255,0.82)'
+      ctx.font = '600 74px Inter, system-ui, sans-serif'
+      ctx.textAlign = 'center'
+      ctx.textBaseline = 'middle'
+      ctx.fillText(label, 64, 68)
+      const t = new THREE.CanvasTexture(c)
+      t.colorSpace = THREE.SRGBColorSpace
+      const rad = (bearing * Math.PI) / 180
+      return {
+        label,
+        tex: t,
+        pos: new THREE.Vector3(r * Math.sin(rad), 26, -r * Math.cos(rad)),
+      }
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // A line on the ground pointing at the sun's bearing — the shadow direction
+  // made explicit, so the reading and the render agree.
+  const sunBearingEnd = useMemo(() => {
+    const rad = (azimuth * Math.PI) / 180
+    return new THREE.Vector3(r * Math.sin(rad), 2, -r * Math.cos(rad))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [azimuth])
+
+  const above = altitude > -0.833
+
+  return (
+    <group>
+      {texts.map((t) => (
+        <sprite key={t.label} position={t.pos} scale={[44, 44, 1]}>
+          <spriteMaterial map={t.tex} transparent opacity={0.55} depthWrite={false} />
+        </sprite>
+      ))}
+      {above && (
+        <line>
+          <bufferGeometry>
+            <bufferAttribute
+              attach="attributes-position"
+              args={[
+                new Float32Array([0, 2, 0, sunBearingEnd.x, sunBearingEnd.y, sunBearingEnd.z]),
+                3,
+              ]}
+            />
+          </bufferGeometry>
+          <lineBasicMaterial color="#ffcc66" transparent opacity={0.35} />
+        </line>
+      )}
+    </group>
+  )
+}
+
+/* ------------------------------------------------------------------ */
 /* The sun, as an actual light                                         */
 /* ------------------------------------------------------------------ */
 
@@ -406,13 +690,26 @@ export function GroundScene({
       <ambientLight intensity={ambient} />
       <SunLight altitude={altitude} azimuth={azimuth} intensity={direct} />
 
+      {/* Sky first — everything else is lit against it. */}
+      <Sky altitude={altitude} azimuth={azimuth} />
+      <SunDisc altitude={altitude} azimuth={azimuth} />
+
       <Terrain data={data} sunDir={sunDir} />
       <Buildings data={data} />
       <GroundPin lit={!below} />
+      <Compass altitude={altitude} azimuth={azimuth} />
 
-      {/* Distance fog matched to the sky so the scene edge dissolves rather
-          than ending in a visible cliff. */}
-      <fog attach="fog" args={[below ? '#0b0e18' : skyTint, SCENE_RADIUS * 0.9, SCENE_RADIUS * 2.6]} />
+      {/* Haze that fades the terrain edge into the sky's horizon colour rather
+          than ending on a visible cliff. Starts further out now that there's
+          an actual sky to blend into. */}
+      <fog
+        attach="fog"
+        args={[
+          below ? '#0d1120' : altitude < 12 ? '#8a6a52' : '#93aec9',
+          SCENE_RADIUS * 1.1,
+          SCENE_RADIUS * 3.2,
+        ]}
+      />
     </group>
   )
 }

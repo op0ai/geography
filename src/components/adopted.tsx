@@ -83,7 +83,9 @@ export function SunOrb({
         // Setting it dark (as the component's own default does, for a light
         // page) hollowed the sun out into a black hole against our dark UI.
         // It has to stay bright so the orb reads as a solid disc.
-        bg: `oklch(${(93 + warmth * 5).toFixed(0)}% ${(0.07 - warmth * 0.03).toFixed(3)} ${(62 + warmth * 26).toFixed(0)})`,
+        // Constant, deliberately near-white. Interpolating this value produced
+        // strings the renderer sometimes resolved dark, hollowing the orb out.
+        bg: 'oklch(96% 0.045 85)',
         // core: near-white at altitude, deep amber at the horizon
         c1: `oklch(${(88 + warmth * 8).toFixed(0)}% ${(0.13 - warmth * 0.05).toFixed(3)} ${(58 + warmth * 32).toFixed(0)})`,
         // mid: the classic solar yellow
@@ -227,7 +229,7 @@ export function PhasePill({
       // The pill is the biggest thing that moves here, so it takes the slow
       // tier — the one tier that keeps a little bounce.
       transition={reduced ? { duration: 0 } : spring.slow}
-      className="relative flex items-center gap-2 rounded-full pl-2 pr-2.5 py-1 cursor-default outline-none"
+      className="relative flex items-center gap-2 rounded-full pl-2 pr-2.5 py-1 cursor-default outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-sun)]"
       style={{
         background: `color-mix(in oklch, ${phase.tint} 18%, transparent)`,
         border: `1px solid color-mix(in oklch, ${phase.tint} 40%, transparent)`,

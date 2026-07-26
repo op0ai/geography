@@ -1,0 +1,14 @@
+{
+  "name": "geography — where the light falls",
+  "short_name": "geography",
+  "description": "Pin any point on Earth at any moment and see exactly what the sun is doing.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0d1020",
+  "theme_color": "#0d1020",
+  "icons": [
+    { "src": "/icon-192.png", "type": "image/png", "sizes": "192x192" },
+    { "src": "/icon-mask.png", "type": "image/png", "sizes": "512x512", "purpose": "maskable" },
+    { "src": "/icon-512.png", "type": "image/png", "sizes": "512x512" }
+  ]
+}

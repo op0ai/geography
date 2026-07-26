@@ -40,7 +40,7 @@ export function PlanetBar({
             role="tab"
             aria-selected={active}
             onClick={() => onSelect(p)}
-            className="relative w-full px-2.5 py-2 r-inner press outline-none group text-left"
+            className="relative w-full px-2.5 py-2 r-inner press outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-sun)] focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--color-void)] group text-left"
           >
             {active && (
               <motion.div

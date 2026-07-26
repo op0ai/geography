@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <style>
+    .night { fill: #202434; }
+    .lit   { fill: #f0f3f8; }
+    .sun   { fill: #f2b52a; }
+    .rim   { fill: #0d1020; }
+    @media (prefers-color-scheme: light) {
+      .night { fill: #2a2f42; }
+      .lit   { fill: #12151f; }
+      .rim   { fill: #ffffff; }
+    }
+  </style>
+  <!-- globe: night base, lit right hemisphere, elliptical terminator -->
+  <circle class="night" cx="15" cy="17" r="11.5"/>
+  <path class="lit" d="M15 5.5a11.5 11.5 0 0 1 0 23 3.9 11.5 0 0 0 0-23z"/>
+  <!-- sun, with a rim disc so it separates from the globe -->
+  <circle class="rim" cx="24.2" cy="7.8" r="5.2"/>
+  <circle class="sun" cx="24.2" cy="7.8" r="3.7"/>
+</svg>

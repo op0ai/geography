@@ -7,10 +7,11 @@
  * curve is always right at every latitude and season — nobody computed it.
  */
 
-import { useRef, useMemo, useLayoutEffect } from 'react'
+import { useRef, useMemo, useEffect, useLayoutEffect } from 'react'
 import { useFrame, useLoader, type ThreeEvent } from '@react-three/fiber'
 import * as THREE from 'three'
 import { latLonToVec3, vec3ToLatLon } from '../lib/solar'
+import { PLACES } from '../lib/places'
 
 const GLOBE_RADIUS = 1
 
@@ -302,10 +303,97 @@ export function Globe({
         />
       </mesh>
 
+      <CityMarkers sunVec={sunVec} />
       <LocationMarker position={markerPos} lit={markerLit} />
       <SubsolarMarker subsolar={subsolar} />
     </group>
   )
+}
+
+/* ------------------------------------------------------------------ */
+/* Cities                                                              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Dots for the curated places.
+ *
+ * The globe was a bare sphere: nothing to aim at, no sense of where anything
+ * is, and no hint that clicking does anything. These give it landmarks — and
+ * they brighten on the night side, because that's where a city is actually
+ * visible from orbit.
+ */
+function CityMarkers({ sunVec }: { sunVec: THREE.Vector3 }) {
+  const geometry = useMemo(() => {
+    const positions: number[] = []
+    for (const p of PLACES) {
+      const [x, y, z] = latLonToVec3(p.lat, p.lon, GLOBE_RADIUS * 1.002)
+      positions.push(x, y, z)
+    }
+    const g = new THREE.BufferGeometry()
+    g.setAttribute(
+      'position',
+      new THREE.Float32BufferAttribute(new Float32Array(positions), 3),
+    )
+    return g
+  }, [])
+
+  useEffect(() => () => geometry.dispose(), [geometry])
+
+  const material = useMemo(
+    () =>
+      new THREE.ShaderMaterial({
+        uniforms: { sunDir: { value: sunVec.clone() } },
+        transparent: true,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        vertexShader: /* glsl */ `
+          uniform vec3 sunDir;
+          varying float vLit;
+          varying float vFacing;
+          void main() {
+            vec3 n = normalize(position);
+            vLit = dot(n, sunDir);
+            vec4 mv = modelViewMatrix * vec4(position, 1.0);
+            // Fade markers on the far limb so the back of the globe doesn't
+            // show through as a haze of dots.
+            vec3 nWorld = normalize(mat3(modelMatrix) * n);
+            vec3 toCam = normalize(cameraPosition - (modelMatrix * vec4(position,1.0)).xyz);
+            vFacing = dot(nWorld, toCam);
+            gl_PointSize = 4.2 * (300.0 / -mv.z);
+            gl_Position = projectionMatrix * mv;
+          }
+        `,
+        fragmentShader: /* glsl */ `
+          varying float vLit;
+          varying float vFacing;
+          void main() {
+            vec2 c = gl_PointCoord - vec2(0.5);
+            float d = length(c);
+            if (d > 0.5) discard;
+            float soft = 1.0 - smoothstep(0.18, 0.5, d);
+            if (vFacing < 0.08) discard;
+            float edge = smoothstep(0.08, 0.35, vFacing);
+            // Warm on the day side, city-light amber at night.
+            vec3 day   = vec3(0.85, 0.92, 1.0);
+            vec3 night = vec3(1.0, 0.78, 0.42);
+            float t = smoothstep(-0.15, 0.15, vLit);
+            vec3 col = mix(night, day, t);
+            float strength = mix(0.95, 0.42, t);
+            gl_FragColor = vec4(col, soft * strength * edge);
+          }
+        `,
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  )
+
+  useFrame(() => {
+    material.uniforms.sunDir.value.copy(sunVec)
+  })
+
+  useEffect(() => () => material.dispose(), [material])
+
+  return <points geometry={geometry} material={material} />
 }
 
 /* ------------------------------------------------------------------ */

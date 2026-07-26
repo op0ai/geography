@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://geography-globe.op0.workers.dev/</loc><changefreq>daily</changefreq><priority>1.0</priority></url>
+  <url><loc>https://geography-globe.op0.workers.dev/?at=69.6492,18.9553&amp;name=Troms%C3%B8&amp;in=Norway</loc><priority>0.8</priority></url>
+  <url><loc>https://geography-globe.op0.workers.dev/?at=64.1466,-21.9426&amp;name=Reykjav%C3%ADk&amp;in=Iceland</loc><priority>0.8</priority></url>
+  <url><loc>https://geography-globe.op0.workers.dev/?at=-0.1807,-78.4678&amp;name=Quito&amp;in=Ecuador</loc><priority>0.8</priority></url>
+  <url><loc>https://geography-globe.op0.workers.dev/?at=78.2232,15.6469&amp;name=Longyearbyen&amp;in=Svalbard</loc><priority>0.8</priority></url>
+</urlset>

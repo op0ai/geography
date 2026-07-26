@@ -47,6 +47,7 @@ import {
   type Place,
 } from './lib/places'
 import { geocode, reverseGeocode, type GeoResult } from './lib/geocode'
+import { decodeState, syncUrl, shareUrl } from './lib/urlstate'
 
 const hexToRgb01 = (hex: string): [number, number, number] => {
   const n = parseInt(hex.slice(1), 16)
@@ -54,13 +55,35 @@ const hexToRgb01 = (hex: string): [number, number, number] => {
 }
 
 export default function App() {
-  const [place, setPlace] = useState<Place | null>(DEFAULT_PLACE)
+  // A shared link should reopen exactly what the sender saw, so state is
+  // hydrated from the querystring before anything renders.
+  const initial = useMemo(
+    () => (typeof window === 'undefined' ? {} : decodeState(window.location.search)),
+    [],
+  )
+
+  const [place, setPlace] = useState<Place | null>(
+    initial.name
+      ? {
+          name: initial.name,
+          country: initial.country ?? '',
+          lat: initial.lat ?? DEFAULT_PLACE.lat,
+          lon: initial.lon ?? DEFAULT_PLACE.lon,
+        }
+      : initial.lat !== undefined
+        ? null
+        : DEFAULT_PLACE,
+  )
   const [coord, setCoord] = useState({
-    lat: DEFAULT_PLACE.lat,
-    lon: DEFAULT_PLACE.lon,
+    lat: initial.lat ?? DEFAULT_PLACE.lat,
+    lon: initial.lon ?? DEFAULT_PLACE.lon,
   })
-  const [date, setDate] = useState(() => new Date())
-  const [planet, setPlanet] = useState<Planet>(PLANET_BY_ID.earth)
+  const [date, setDate] = useState(() =>
+    initial.t ? new Date(initial.t) : new Date(),
+  )
+  const [planet, setPlanet] = useState<Planet>(
+    (initial.planet && PLANET_BY_ID[initial.planet]) || PLANET_BY_ID.earth,
+  )
   const [playing, setPlaying] = useState(false)
   const [speed, setSpeed] = useState(600)
   const [query, setQuery] = useState('')
@@ -72,6 +95,10 @@ export default function App() {
   // Bumped to request a mode flip — zooming works too, but a button is
   // discoverable in a way that "keep scrolling" is not.
   const [descend, setDescend] = useState(0)
+  // Incremented by the zoom buttons; the Scene reads the delta and moves the
+  // camera. A counter rather than a value so repeated clicks always register.
+  const [zoomNudge, setZoomNudge] = useState(0)
+  const [copied, setCopied] = useState(false)
 
   const isEarth = planet.id === 'earth'
 
@@ -258,6 +285,20 @@ export default function App() {
     }
   }, [query])
 
+  // Mirror state into the address bar (replaceState, so scrubbing time doesn't
+  // fill the back button with hundreds of entries).
+  useEffect(() => {
+    syncUrl({
+      lat: coord.lat,
+      lon: coord.lon,
+      t: date.toISOString(),
+      planet: planet.id,
+      mode: viewMode,
+      name: place?.name,
+      country: place?.country,
+    })
+  }, [coord.lat, coord.lon, date, planet.id, viewMode, place?.name, place?.country])
+
   const results = useMemo(() => {
     const local: GeoResult[] = localResults.map((p) => ({
       name: p.name,
@@ -288,6 +329,26 @@ export default function App() {
       timeZone: 'UTC',
     })
   }, [date, coord.lon])
+
+  const copyShareLink = useCallback(async () => {
+    const url = shareUrl({
+      lat: coord.lat,
+      lon: coord.lon,
+      t: date.toISOString(),
+      planet: planet.id,
+      mode: viewMode,
+      name: place?.name,
+      country: place?.country,
+    })
+    try {
+      await navigator.clipboard.writeText(url)
+    } catch {
+      // Clipboard can be blocked; a prompt is an ugly but working fallback.
+      window.prompt('Copy this link', url)
+    }
+    setCopied(true)
+    setTimeout(() => setCopied(false), 1800)
+  }, [coord, date, planet.id, viewMode, place])
 
   const pick = useCallback((lat: number, lon: number) => {
     setCoord({ lat, lon })
@@ -328,7 +389,8 @@ export default function App() {
           surfaceTexture={planet.texture ?? '/textures/earth_day_4096.jpg'}
           atmosphereTint={hexToRgb01(planet.color)}
           hasAtmosphere={planet.id !== 'moon' && planet.id !== 'mercury'}
-          autoRotate={follow}
+          autoRotate={false}
+          zoomNudge={zoomNudge}
           sunAltitude={alien ? alien.altitude : sun.altitude}
           sunAzimuth={alien ? alien.azimuth : sun.azimuth}
           skyTint={phase.tint}
@@ -364,25 +426,49 @@ export default function App() {
           </div>
 
           <div className="pointer-events-auto flex items-center gap-2">
+            {/* Zoom. "Follow pin" used to live here — it locked the orbit
+                controls and slowly drifted the camera, with a label that
+                explained none of that. It also disabled the drag-to-rotate
+                people were reaching for. Explicit zoom is what they wanted. */}
+            {isEarth && viewMode === 'globe' && (
+              <div className="panel r-outer flex items-center p-1 gap-0.5">
+                <button
+                  onClick={() => setZoomNudge((z) => z - 1)}
+                  aria-label="Zoom out"
+                  title="Zoom out"
+                  className="relative w-9 h-9 r-inner press flex items-center justify-center text-[var(--color-ink-mute)] hover:text-[var(--color-ink)] hover:bg-white/8 after:absolute after:-inset-1 after:content-['']"
+                >
+                  <svg width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
+                    <rect x="1" y="5.75" width="11" height="1.5" rx="0.75" fill="currentColor" />
+                  </svg>
+                </button>
+                <button
+                  onClick={() => setZoomNudge((z) => z + 1)}
+                  aria-label="Zoom in"
+                  title="Zoom in"
+                  className="relative w-9 h-9 r-inner press flex items-center justify-center text-[var(--color-ink-mute)] hover:text-[var(--color-ink)] hover:bg-white/8 after:absolute after:-inset-1 after:content-['']"
+                >
+                  <svg width="13" height="13" viewBox="0 0 13 13" aria-hidden="true">
+                    <rect x="1" y="5.75" width="11" height="1.5" rx="0.75" fill="currentColor" />
+                    <rect x="5.75" y="1" width="1.5" height="11" rx="0.75" fill="currentColor" />
+                  </svg>
+                </button>
+              </div>
+            )}
+
             {isEarth && (
               <button
                 onClick={() => setDescend((d) => d + 1)}
                 className="px-3 py-2 r-inner press text-[11px] w-medium border panel text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]"
+                title={
+                  viewMode === 'ground'
+                    ? 'Return to the globe'
+                    : 'Stand at this location and see the real terrain and buildings'
+                }
               >
-                {viewMode === 'ground' ? 'Back to orbit' : 'Land here'}
+                {viewMode === 'ground' ? 'Back to orbit' : 'Stand here'}
               </button>
             )}
-            <button
-              onClick={() => setFollow((f) => !f)}
-              className={`px-3 py-2 r-inner press text-[11px] w-medium border ${
-                follow
-                  ? 'bg-[var(--color-sun)]/18 border-[var(--color-sun)]/45 text-[var(--color-sun)]'
-                  : 'panel text-[var(--color-ink-mute)] hover:text-[var(--color-ink)]'
-              }`}
-              aria-pressed={follow}
-            >
-              {follow ? 'Following' : 'Follow pin'}
-            </button>
             <button
               onClick={() => setShowSearch(true)}
               className="px-3 py-2 r-inner press text-[11px] w-medium panel text-[var(--color-ink-mute)] hover:text-[var(--color-ink)] flex items-center gap-2"
@@ -391,6 +477,42 @@ export default function App() {
               <kbd className="text-[9px] px-1 py-0.5 rounded bg-white/8 text-[var(--color-ink-faint)]">
                 /
               </kbd>
+            </button>
+
+            {/* Share. Every view is already a URL — this just hands it over. */}
+            <button
+              onClick={copyShareLink}
+              aria-label="Copy a link to this exact view"
+              title="Copy a link to this exact view"
+              className="px-3 py-2 r-inner press text-[11px] w-medium panel text-[var(--color-ink-mute)] hover:text-[var(--color-ink)] flex items-center gap-2 min-w-[86px] justify-center"
+            >
+              <AnimatePresence mode="wait" initial={false}>
+                <motion.span
+                  key={copied ? 'copied' : 'share'}
+                  initial={{ opacity: 0, y: 3 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -3, transition: exit.fast }}
+                  transition={spring.fast}
+                  className="flex items-center gap-1.5"
+                  style={copied ? { color: 'var(--color-sun)' } : undefined}
+                >
+                  {copied ? (
+                    <>
+                      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true">
+                        <path d="M2 6.4 4.6 9 10 3.2" strokeLinecap="round" strokeLinejoin="round" />
+                      </svg>
+                      Copied
+                    </>
+                  ) : (
+                    <>
+                      <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                        <path d="M4.5 7.5 7.5 4.5M5 2.5l.8-.8a2.4 2.4 0 0 1 3.5 3.5l-.8.8M7 9.5l-.8.8a2.4 2.4 0 0 1-3.5-3.5l.8-.8" strokeLinecap="round" />
+                      </svg>
+                      Share
+                    </>
+                  )}
+                </motion.span>
+              </AnimatePresence>
             </button>
           </div>
         </div>
@@ -965,7 +1087,7 @@ export default function App() {
             <div className="flex items-center gap-2.5">
               <button
                 onClick={() => setPlaying((p) => !p)}
-                className="w-9 h-9 r-inner press bg-white/10 hover:bg-white/16 flex items-center justify-center border hairline"
+                className="relative w-9 h-9 r-inner press bg-white/10 hover:bg-white/16 flex items-center justify-center border hairline after:absolute after:-inset-1 after:content-['']"
                 aria-label={playing ? 'Pause' : 'Play'}
               >
                 {/* Cross-fade the glyph rather than hard-swapping it.
@@ -1120,6 +1242,10 @@ export default function App() {
                     if (e.key === 'Enter' && results[0]) choose(results[0])
                   }}
                   placeholder="Search a place…"
+                  aria-label="Search for a place"
+                  type="search"
+                  autoComplete="off"
+                  spellCheck={false}
                   className="w-full px-4 py-3.5 bg-transparent outline-none text-[15px] placeholder:text-[var(--color-ink-faint)]"
                 />
                 {(results.length > 0 || query.trim().length >= 2) && (

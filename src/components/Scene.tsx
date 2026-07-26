@@ -39,6 +39,8 @@ interface SceneProps {
   allowGround: boolean
   /** increment to toggle between globe and ground from the UI */
   descendSignal?: number
+  /** +1 zooms in, -1 zooms out; a counter so repeat clicks always register */
+  zoomNudge?: number
   onModeChange?: (mode: 'globe' | 'ground') => void
   onGroundState?: (s: GroundState) => void
 }
@@ -162,24 +164,48 @@ function ModeWatcher({
   return null
 }
 
-/** Camera rig for the ground scene, in metres rather than globe radii. */
-function GroundCamera({ active }: { active: boolean }) {
+/**
+ * Camera rig for the ground scene, in metres rather than globe radii.
+ *
+ * Crucially, it arrives FACING THE SUN. The first version dropped you at a
+ * fixed bearing regardless of where the light was, so on a westerly afternoon
+ * the sun sat behind your head and the whole scene became a guessing game
+ * about the light source. Landing with the sun in frame is the entire point of
+ * standing here.
+ */
+function GroundCamera({
+  active,
+  sunAzimuth,
+  sunAltitude,
+}: {
+  active: boolean
+  sunAzimuth: number
+  sunAltitude: number
+}) {
   const { camera } = useThree()
-  const done = useRef(false)
 
   useEffect(() => {
-    if (!active) {
-      done.current = false
-      return
-    }
-    // Arrive looking across the scene at a low angle — that's the view where
-    // shadows read, and the reason to be down here at all.
-    camera.position.set(0, 190, 470)
-    camera.lookAt(0, 30, 0)
+    if (!active) return
+
+    // Stand on the opposite side of the pin from the sun and look back toward
+    // it: sun in the sky ahead, shadows stretching toward the viewer.
+    const az = (sunAzimuth * Math.PI) / 180
+    const back = 560
+    // Low camera, look UP toward the horizon. The first attempt sat at 210m
+    // aiming down at the ground, which framed the terrain but pushed the sun
+    // clean out of the top of the shot — the one thing you came here to see.
+    camera.position.set(-back * Math.sin(az), 130, back * Math.cos(az))
+    // Aim at the sun's own altitude, so it lands in frame whatever the hour.
+    // A fixed pitch put it above the top of the shot every afternoon.
+    const sunH = 130 + Math.tan((Math.max(4, sunAltitude) * Math.PI) / 180) * back * 0.82
+    camera.lookAt(-200 * Math.sin(az), Math.min(sunH, 900), 200 * Math.cos(az))
     camera.near = 1
     camera.far = SCENE_RADIUS * 12
     camera.updateProjectionMatrix()
-    done.current = true
+    // Only on entering ground mode — re-aiming while the user drags would
+    // fight them for control.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active, camera])
 
   useEffect(() => {
@@ -193,6 +219,31 @@ function GroundCamera({ active }: { active: boolean }) {
     }
     camera.updateProjectionMatrix()
   }, [active, camera])
+
+  return null
+}
+
+/** Applies the zoom buttons' nudges to the camera. */
+function ZoomControl({ nudge }: { nudge: number }) {
+  const { camera } = useThree()
+  const last = useRef(nudge)
+  const target = useRef<number | null>(null)
+
+  if (nudge !== last.current) {
+    const dir = Math.sign(nudge - last.current)
+    last.current = nudge
+    const d = camera.position.length()
+    // 22% per click — enough to feel like progress, small enough to aim with.
+    target.current = THREE.MathUtils.clamp(d * (dir > 0 ? 0.78 : 1.28), 1.45, 7)
+  }
+
+  useFrame((_, delta) => {
+    if (target.current === null) return
+    const d = camera.position.length()
+    const next = THREE.MathUtils.damp(d, target.current, 9, delta)
+    camera.position.setLength(next)
+    if (Math.abs(next - target.current) < 0.005) target.current = null
+  })
 
   return null
 }
@@ -215,6 +266,7 @@ export function Scene({
   skyTint,
   allowGround,
   descendSignal = 0,
+  zoomNudge = 0,
   onModeChange,
   onGroundState,
 }: SceneProps) {
@@ -322,8 +374,9 @@ export function Scene({
         />
       )}
 
+      {!isGround && <ZoomControl nudge={zoomNudge} />}
       <ModeWatcher enabled={allowGround} mode={mode} onChange={setMode} />
-      <GroundCamera active={isGround} />
+      <GroundCamera active={isGround} sunAzimuth={sunAzimuth} sunAltitude={sunAltitude} />
 
       {!isGround && <GlobeCamera target={marker} enabled={autoRotate} controls={controlsRef} />}
 
