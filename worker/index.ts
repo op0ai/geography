@@ -303,6 +303,24 @@ export default {
     }
 
     /* ---- agent-readable surfaces ---- */
+    // AGENTS.md — the agents.md standard (agents.md, stewarded by the Linux
+    // Foundation). llms.txt says what the site IS; AGENTS.md says how to work
+    // on it. Both belong on the wire: an agent sent to contribute shouldn't
+    // have to clone the repo to learn that the astronomy is test-verified.
+    if (url.pathname === '/AGENTS.md' || url.pathname === '/agents.md') {
+      const res = await env.ASSETS.fetch(
+        new Request(new URL('/AGENTS.md', url.origin), request),
+      )
+      if (res.ok) {
+        return new Response(res.body, {
+          headers: {
+            'Content-Type': 'text/markdown; charset=utf-8',
+            'Cache-Control': 'public, max-age=3600',
+          },
+        })
+      }
+    }
+
     if (url.pathname === '/llms.txt') {
       return new Response(LLMS_TXT, {
         headers: {
@@ -445,7 +463,9 @@ as a markdown table, with no JavaScript required.
 
 ## Optional
 
-- [Source](https://github.com/arthtyagi/geography)
+- [AGENTS.md](${SITE}/AGENTS.md): how to work ON this codebase — setup, the
+  verification suites, and the bugs that shaped the current design
+- [Source](https://github.com/op0ai/geography)
 `
 
 const ROBOTS = `# geography — https://geography-globe.op0.workers.dev

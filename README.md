@@ -53,6 +53,12 @@ Google's is $6 per 1,000 tile requests with 1,000 free per month.
 React 19 · three 0.185 · @react-three/fiber 9.6 · @react-three/drei 10.7 ·
 Tailwind v4 · Vite · deployed to Cloudflare Workers.
 
+## For AI agents
+
+See [AGENTS.md](./AGENTS.md) — setup, the verification suites, and the design
+decisions that were bugs first. Also served live at
+[/AGENTS.md](https://geography-globe.op0.workers.dev/AGENTS.md).
+
 ## Development
 
 ```bash
