@@ -62,11 +62,9 @@ export type GroundState =
 function Sun({
   subsolar,
   angularSize,
-  brightness,
 }: {
   subsolar: { lat: number; lon: number }
   angularSize: number
-  brightness: number
 }) {
   const DIST = 22
   const pos = useMemo(() => {
@@ -78,47 +76,24 @@ function Sun({
     () => DIST * Math.tan((angularSize / 2) * (Math.PI / 180)),
     [angularSize],
   )
-  const glowScale = 1 + Math.min(3.2, 0.55 / Math.max(0.06, angularSize))
-  const glow = useGlowTexture()
-
   return (
     <group position={pos}>
       <mesh>
         <sphereGeometry args={[radius, 32, 32]} />
         <meshBasicMaterial color="#fff8e7" toneMapped={false} />
       </mesh>
-      <sprite scale={[radius * 9 * glowScale, radius * 9 * glowScale, 1]}>
-        <spriteMaterial
-          map={glow}
-          transparent
-          opacity={Math.min(0.85, 0.28 + brightness * 0.4)}
-          blending={THREE.AdditiveBlending}
-          depthWrite={false}
-          toneMapped={false}
-        />
-      </sprite>
-      <pointLight intensity={2.2} distance={0} decay={0} color="#fff6e0" />
+      {/* No corona sprite in globe mode.
+          A sprite always faces the camera, so when the subsolar point rotated
+          toward the viewer this additive quad sat between the camera and Earth
+          and painted a large ghost disc over the continents. depthTest didn't
+          save it — the sprite is genuinely in front at that angle.
+
+          It also wasn't earning its place: at true angular size the sun is a
+          few pixels here, and the atmosphere shell already communicates which
+          limb is lit. The ground scene has its own sun, where a corona makes
+          sense because you're actually looking at the sky. */}
     </group>
   )
-}
-
-function useGlowTexture() {
-  return useMemo(() => {
-    const size = 128
-    const canvas = document.createElement('canvas')
-    canvas.width = canvas.height = size
-    const ctx = canvas.getContext('2d')!
-    const g = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2)
-    g.addColorStop(0, 'rgba(255,248,231,1)')
-    g.addColorStop(0.18, 'rgba(255,236,190,0.55)')
-    g.addColorStop(0.45, 'rgba(255,214,140,0.16)')
-    g.addColorStop(1, 'rgba(255,200,120,0)')
-    ctx.fillStyle = g
-    ctx.fillRect(0, 0, size, size)
-    const tex = new THREE.CanvasTexture(canvas)
-    tex.colorSpace = THREE.SRGBColorSpace
-    return tex
-  }, [])
 }
 
 /* ------------------------------------------------------------------ */
@@ -339,7 +314,10 @@ export function Scene({
         antialias: true,
         alpha: true,
         toneMapping: THREE.ACESFilmicToneMapping,
-        toneMappingExposure: 0.85 + Math.min(0.5, brightness * 0.3),
+        // Exposure was compounding with the shader's own brightness, blowing
+        // the day side to pure white. The shader already scales by irradiance;
+        // this only needs to lift the very dim outer planets.
+        toneMappingExposure: 0.92 + Math.min(0.22, (1 - Math.min(1, brightness)) * 0.22),
       }}
       shadows
       dpr={[1, 2]}
@@ -349,7 +327,7 @@ export function Scene({
       {!isGround && (
         <>
           <Stars radius={60} depth={30} count={3500} factor={3.5} saturation={0} fade speed={0.4} />
-          <Sun subsolar={subsolar} angularSize={sunAngularSize} brightness={brightness} />
+          <Sun subsolar={subsolar} angularSize={sunAngularSize} />
           <Suspense fallback={null}>
             <Globe
               subsolar={subsolar}

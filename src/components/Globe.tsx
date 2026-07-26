@@ -65,7 +65,21 @@ const earthFragment = /* glsl */ `
     // linger through twilight — fade them out as the sky brightens.
     float nightFade = 1.0 - smoothstep(-0.25, 0.05, sunDot);
     vec3 color = mix(vec3(0.0), nightColor * nightLightStrength, nightFade);
-    color = mix(color, dayColor, dayMix);
+
+    // LAMBERT. This is the bit that was missing, and it's why the globe looked
+    // lit from everywhere at once: dayMix saturates at 1.0 as soon as sunDot
+    // passes 0.22, so the whole day hemisphere rendered at identical full
+    // brightness — a flat disc of daylight with a soft edge, no direction.
+    //
+    // Real illumination falls off as the cosine of the angle between the
+    // surface normal and the sun. That cosine IS sunDot. Applying it makes the
+    // subsolar point the obvious bright spot and the limb fall away, which is
+    // what tells your eye where the light is coming from.
+    float lambert = max(sunDot, 0.0);
+    // Slight lift off pure cosine so the terminator doesn't crush to black
+    // before the twilight band takes over.
+    float diffuse = pow(lambert, 0.75);
+    color = mix(color, dayColor * (0.12 + 0.88 * diffuse), dayMix);
 
     // --- the twilight band ------------------------------------------
     // Warm light hugging the terminator. This is the detail that makes the
@@ -82,21 +96,27 @@ const earthFragment = /* glsl */ `
     float clouds = smoothstep(0.22, 0.85, packed.b) * cloudOpacity;
     // Clouds catch the light slightly beyond the terminator — they're above
     // the surface, so they're still lit when the ground below has gone dark.
+    // Clouds catch the sun by the same cosine law. Without this they read as
+    // a flat white overlay pasted on the day side.
     float cloudLight = smoothstep(-0.28, 0.32, sunDot);
-    color = mix(color, vec3(1.0) * (0.25 + 0.75 * cloudLight), clouds * 0.75 * (0.3 + 0.7 * cloudLight));
+    float cloudLambert = pow(max(sunDot, 0.0), 0.7);
+    vec3 cloudLit = vec3(1.0) * (0.08 + 0.92 * cloudLambert);
+    color = mix(color, cloudLit, clouds * 0.8 * cloudLight);
 
     // --- specular on water -------------------------------------------
     // G is roughness: near zero over ocean, saturated over land.
     float water = 1.0 - smoothstep(0.15, 0.45, packed.g);
     vec3 halfVec = normalize(sunDirection + viewDir);
     float spec = pow(max(dot(normal, halfVec), 0.0), 90.0);
-    color += vec3(1.0, 0.96, 0.88) * spec * water * dayMix * 0.55 * (1.0 - clouds);
+    color += vec3(1.0, 0.96, 0.88) * spec * water * lambert * 0.6 * (1.0 - clouds);
 
     // --- atmosphere rim ----------------------------------------------
     float fresnel = pow(1.0 - max(dot(normal, viewDir), 0.0), 2.6);
     // Only the lit limb should glow; the night limb stays dark.
     float rimLight = smoothstep(-0.35, 0.45, sunDot);
-    color += atmosphereColor * fresnel * rimLight * atmosphereStrength;
+    // Kept subtle: the atmosphere shell already draws the limb glow, and
+    // stacking two additive rim terms is what over-brightened the edge.
+    color += atmosphereColor * fresnel * rimLight * atmosphereStrength * 0.45 * (0.25 + 0.75 * lambert);
 
     gl_FragColor = vec4(color, 1.0);
     #include <colorspace_fragment>
@@ -132,16 +152,28 @@ const atmosphereFragment = /* glsl */ `
     vec3 viewDir = normalize(cameraPos - vPositionW);
     float sunDot = dot(normal, sunDirection);
 
-    // Backside shell: the fresnel is inverted relative to the surface.
-    float fresnel = pow(max(dot(normal, viewDir), 0.0), 2.2);
+    // FRONT-side shell now. It used to render BackSide, which draws the far
+    // half of the sphere — geometry that sits behind the planet but, with
+    // additive blending and depthWrite off, still composited straight over it.
+    // Worse, on a back face the fresnel peaks in the MIDDLE of the disc rather
+    // than at the limb, so it flooded the centre of Earth with white haze.
+    //
+    // On the front face the correct rim term is the usual one: bright where
+    // the surface turns away from the camera, i.e. at the edge.
+    float fresnel = pow(1.0 - max(dot(normal, viewDir), 0.0), 3.0);
 
     // Sunset reddening: the atmosphere goes warm exactly where the sun is
     // grazing, which is what makes the limb look like a real horizon.
     float warm = smoothstep(0.35, -0.15, sunDot) * smoothstep(-0.5, -0.1, sunDot);
     vec3 color = mix(dayColor, twilightColor, warm);
 
-    float lit = smoothstep(-0.45, 0.35, sunDot);
-    float alpha = fresnel * lit * intensity;
+    // The shell used a wide smoothstep, so it haloed the ENTIRE limb — including
+    // the night side — which is a large part of why the light looked
+    // omnidirectional. Scattering is strongest where the sun actually is, so
+    // weight it by the cosine and let the night limb go dark.
+    float lit = smoothstep(-0.35, 0.25, sunDot);
+    float facing = pow(max(sunDot, 0.0), 0.6);
+    float alpha = fresnel * lit * intensity * (0.18 + 0.82 * facing);
 
     gl_FragColor = vec4(color, alpha);
     #include <colorspace_fragment>
@@ -297,7 +329,7 @@ export function Globe({
           fragmentShader={atmosphereFragment}
           uniforms={atmoUniforms}
           transparent
-          side={THREE.BackSide}
+          side={THREE.FrontSide}
           depthWrite={false}
           blending={THREE.AdditiveBlending}
         />
@@ -359,7 +391,12 @@ function CityMarkers({ sunVec }: { sunVec: THREE.Vector3 }) {
             vec3 nWorld = normalize(mat3(modelMatrix) * n);
             vec3 toCam = normalize(cameraPosition - (modelMatrix * vec4(position,1.0)).xyz);
             vFacing = dot(nWorld, toCam);
-            gl_PointSize = 4.2 * (300.0 / -mv.z);
+            // Perspective point size. The constant here has to be in the
+            // scene's own units — the globe has radius 1, so a factor tuned
+            // for a 300-unit scene produced ~400px sprites that stacked into
+            // a giant ghost disc over the continents. 3.5 gives a ~3px dot at
+            // the default camera distance and grows sensibly as you zoom in.
+            gl_PointSize = clamp(3.5 / -mv.z * 4.0, 1.5, 9.0);
             gl_Position = projectionMatrix * mv;
           }
         `,
