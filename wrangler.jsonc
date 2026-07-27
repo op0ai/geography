@@ -13,5 +13,17 @@
     // textures, icons) still goes straight to the asset server.
     "run_worker_first": ["/", "/index.html", "/og.png", "/og.svg", "/llms.txt", "/robots.txt", "/.well-known/*", "/api/*"]
   },
+  // Building footprints, cached permanently.
+  //
+  // Overpass allows ~2 concurrent queries per IP and every Worker request
+  // shares one IP, so under real traffic most cold queries simply fail —
+  // measured 2 of 8 concurrent cold cities succeeding. But buildings don't
+  // move. Once an area has been fetched it never needs fetching again, so R2
+  // turns "Overpass must answer right now" into "Overpass must have answered
+  // once, ever, for this area".
+  "r2_buckets": [
+    { "binding": "BUILDINGS", "bucket_name": "geography-buildings" }
+  ],
+
   "observability": { "enabled": true }
 }

@@ -168,12 +168,39 @@ fails to parse — returning a **504 that looks like a timeout** rather than the
 malformed request it is. This cost a debugging cycle; the header is now explicit
 in both the Worker proxy and the direct-mirror fallback.
 
-**Buildings go through `/api/buildings`, not straight to Overpass.** Overpass
-rate-limits per client IP, so direct calls mean a traffic spike throttles every
-visitor and the headline feature silently degrades. The edge proxy caches for a
-day (a week stale-while-revalidate) and Cloudflare collapses concurrent requests
-for the same tile into one upstream query. Measured: 1,806 buildings for central
-London in 2.6s cold, 0.24s warm. The direct mirrors remain as a dev fallback.
+### Buildings: three cache tiers, because Overpass allows two queries
+
+Overpass rate-limits by **concurrency, not rate**. Its own `/api/status` says
+so: `Rate limit: 2`. Every Worker request shares one IP, so the third
+simultaneous cold query gets HTTP 406 in half a second. Measured under load:
+**only 2 of 8 concurrent cold cities returned at all.**
+
+That is a fair-use limit on a public good, not a bug to engineer around. The
+answer is to ask once instead of asking harder:
+
+1. **Edge cache** (`caches.default`) — same colo, ~200ms.
+2. **R2** (`BUILDINGS` binding) — anywhere in the world has asked before.
+   Permanent; buildings don't move.
+3. **Overpass** — only the first person ever to look at this spot.
+
+`scripts/seed-buildings.mjs` pre-populates tiers 1-2 for the curated places,
+serially with a 2.5s pause. Run it before any launch or traffic event.
+
+**Do NOT add a background prefetch.** Warming the 700m query inside
+`ctx.waitUntil` after serving a 300m one is the obvious next idea and it makes
+things dramatically worse — a single cold request went from ~2s to ~37s,
+because the warm-up competes for the same two slots as the request that spawned
+it. The comment in `worker/index.ts` says this too; please leave it there.
+
+**The client asks for 300m first, then 700m.** The narrow query returns in ~2s
+when the wide one times out. They usually agree exactly — but Berlin differed
+by **90 minutes**, because a ring of tall blocks sits just past 300m. So the
+wide query genuinely matters; it just shouldn't block the first answer.
+
+**Asset routing eats `/api/_*`.** A route named `/api/_r2check` returned an
+empty 404 while `/api/buildings` worked fine — underscore-prefixed paths are
+treated as hidden assets regardless of `run_worker_first`. Don't prefix Worker
+routes with an underscore.
 
 ## Motion
 

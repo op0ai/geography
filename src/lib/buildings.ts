@@ -157,23 +157,64 @@ export async function fetchBuildings(
   // Try our edge proxy first: cached, deduplicated, and far faster than a
   // cold Overpass query. Skipped when running against a dev server with no
   // Worker in front of it, which returns the SPA's index.html for /api/*.
-  try {
-    const proxyUrl =
-      `${PROXY}?lat=${lat.toFixed(5)}&lon=${lon.toFixed(5)}&r=${Math.round(radiusMetres)}`
-    const res = await fetch(proxyUrl, {
-      signal: signal ?? AbortSignal.timeout(22_000),
-    })
-    if (res.ok && res.headers.get('content-type')?.includes('json')) {
-      const json = await res.json()
-      if (Array.isArray(json?.elements)) {
-        const out = parseOverpass(json)
-        cache.set(key, out)
-        lastFetchFailed = false
-        return out
+  //
+  // The retry exists because Overpass rate-limits by CONCURRENCY (~2 queries
+  // per IP) rather than by rate, and answers the overflow with 406 in under a
+  // second. Under load that's the common case, not the exceptional one — so a
+  // 429 from our proxy means "a slot will free up shortly", and waiting two
+  // seconds is much better than telling someone their street has no buildings.
+  //
+  // Two radii, narrowest first. A 300m query returns in ~2s even when Overpass
+  // is congested; a 700m query in a dense European centre can take 10s or time
+  // out entirely. Measured at the winter solstice the two usually agree to the
+  // minute — but Berlin differed by 90 minutes, because a ring of tall blocks
+  // sits just past 300m. So the wide query matters; it just shouldn't be the
+  // thing standing between you and a first answer.
+  const ATTEMPTS: { radius: number; delay: number }[] = [
+    { radius: Math.min(300, radiusMetres), delay: 0 },
+    { radius: radiusMetres, delay: 0 },
+    { radius: radiusMetres, delay: 2500 },
+  ]
+
+  let best: Building[] | null = null
+
+  for (const { radius, delay } of ATTEMPTS) {
+    if (signal?.aborted) break
+    if (delay) await new Promise((r) => setTimeout(r, delay))
+
+    try {
+      const proxyUrl =
+        `${PROXY}?lat=${lat.toFixed(5)}&lon=${lon.toFixed(5)}&r=${Math.round(radius)}`
+      const res = await fetch(proxyUrl, {
+        signal: signal ?? AbortSignal.timeout(30_000),
+      })
+
+      // Busy upstream. Worth another go after a pause.
+      if (res.status === 429) continue
+
+      if (res.ok && res.headers.get('content-type')?.includes('json')) {
+        const json = await res.json()
+        if (Array.isArray(json?.elements)) {
+          const out = parseOverpass(json)
+          // Keep the widest successful result. A later, wider query that fails
+          // must not discard an earlier narrow one that worked.
+          if (!best || out.length > best.length) best = out
+          // The narrow pass is a stopgap; keep going for the full radius.
+          if (radius >= radiusMetres) break
+          continue
+        }
       }
+      // Non-retryable. Stop asking the proxy.
+      break
+    } catch {
+      break
     }
-  } catch {
-    // Fall through to the direct mirrors.
+  }
+
+  if (best) {
+    cache.set(key, best)
+    lastFetchFailed = false
+    return best
   }
 
   for (const endpoint of ENDPOINTS) {

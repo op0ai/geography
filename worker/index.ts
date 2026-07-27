@@ -17,6 +17,8 @@ import { Raster, text, measure, encodePng, hex } from './png'
 
 interface Env {
   ASSETS: { fetch: (req: Request) => Promise<Response> }
+  /** Permanent store for building footprints. See the /api/buildings route. */
+  BUILDINGS?: R2Bucket
 }
 
 const SITE = 'https://geography-globe.op0.workers.dev'
@@ -206,6 +208,94 @@ function metaFor(v: ReturnType<typeof parseView>, url: URL) {
 
 /* ------------------------------------------------------------------ */
 
+
+/**
+ * Fetch building footprints for an area from Overpass.
+ *
+ * Extracted from the request handler so the background warm can call it
+ * directly. Re-fetching our own URL to warm the cache doesn't work — a Worker
+ * fetching itself doesn't populate `caches.default`.
+ *
+ * Overpass rate-limits per client IP by CONCURRENCY, not by rate: the public
+ * instance allows ~2 simultaneous queries and answers the third with HTTP 406
+ * in under half a second. Measured directly — four parallel cold queries
+ * returned 200, 200, 406, 406. That's the front-page failure mode, so 406 and
+ * 429 mean "try the next mirror now", not "this mirror is dead".
+ *
+ * Relations are dropped on the retry passes. `out geom` on relations is the
+ * expensive half of the query — dense European centres time out on it while
+ * the ways alone return in ~2s. Multipolygon buildings (the ones with
+ * courtyards) are a small minority, and a missing courtyard changes a shading
+ * answer far less than missing the whole street does.
+ */
+async function fetchBuildingArea(
+  lat: number,
+  lon: number,
+  radius: number,
+): Promise<{ ok: boolean; body: string; rateLimited: boolean }> {
+  const dLat = radius / 111320
+  const dLon = radius / (111320 * Math.cos((lat * Math.PI) / 180))
+  const bbox = [
+    (lat - dLat).toFixed(6),
+    (lon - dLon).toFixed(6),
+    (lat + dLat).toFixed(6),
+    (lon + dLon).toFixed(6),
+  ].join(',')
+
+  const withRelations =
+    `[out:json][timeout:20];(way["building"](${bbox});relation["building"](${bbox}););out geom;`
+  const waysOnly = `[out:json][timeout:20];(way["building"](${bbox}););out geom;`
+
+  const MIRRORS = [
+    'https://overpass-api.de/api/interpreter',
+    'https://overpass.private.coffee/api/interpreter',
+    'https://overpass.kumi.systems/api/interpreter',
+  ]
+  const PASSES = [withRelations, waysOnly, waysOnly]
+
+  let rateLimited = false
+
+  for (let attempt = 0; attempt < PASSES.length; attempt++) {
+    for (const endpoint of MIRRORS) {
+      try {
+        const upstream = await fetch(endpoint, {
+          method: 'POST',
+          body: 'data=' + encodeURIComponent(PASSES[attempt]),
+          headers: {
+            // Overpass will not parse the body without this. Worker fetch
+            // defaults a string body to text/plain, which the server accepts
+            // and then fails to read — returning a 504 that looks like a
+            // timeout rather than the malformed request it is.
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'User-Agent': 'geography-globe (+https://geography-globe.op0.workers.dev)',
+          },
+          // Measured: central Berlin takes ~9s cold with no contention, so a
+          // 12s ceiling was cutting off requests that were about to succeed.
+          signal: AbortSignal.timeout(attempt === 0 ? 18_000 : 12_000),
+        })
+
+        if (upstream.status === 406 || upstream.status === 429) {
+          rateLimited = true
+          continue
+        }
+        if (!upstream.ok) continue
+
+        return { ok: true, body: await upstream.text(), rateLimited }
+      } catch {
+        // Timed out or the connection failed — try the next mirror.
+      }
+    }
+
+    // Only pause when the mirrors were busy rather than slow. A timeout means
+    // the next pass, with its cheaper query, should start at once.
+    if (rateLimited && attempt < PASSES.length - 1) {
+      await new Promise((r) => setTimeout(r, 1200))
+    }
+  }
+
+  return { ok: false, body: '', rateLimited }
+}
+
 /** Small JSON responder for the API routes. */
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -364,80 +454,100 @@ export default {
         return jsonResponse({ error: 'bad coordinates' }, 400)
       }
 
-      // Round the cache key so nearby requests share an entry. 0.001° is
-      // ~111m north-south — small relative to the scene, large enough to
-      // collapse the traffic from everyone looking at the same landmark.
+      // Round the key so nearby requests share an entry. 0.001° is ~111m
+      // north-south — small relative to the scene, large enough to collapse
+      // the traffic from everyone looking at the same landmark.
       const qLat = Math.round(lat * 1000) / 1000
       const qLon = Math.round(lon * 1000) / 1000
+
+      const cache = caches.default
       const cacheUrl = new URL(url)
       cacheUrl.search = `?lat=${qLat}&lon=${qLon}&r=${radius}`
       const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' })
-      const cache = caches.default
+      const r2Key = `v1/${qLat.toFixed(3)},${qLon.toFixed(3)}/${radius}.json`
 
-      const cached = await cache.match(cacheKey)
-      if (cached) {
-        const r = new Response(cached.body, cached)
-        r.headers.set('x-cache', 'hit')
+      const headers = (source: string) => ({
+        'content-type': 'application/json; charset=utf-8',
+        'cache-control':
+          'public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800, stale-if-error=604800',
+        'access-control-allow-origin': '*',
+        'x-cache': source,
+      })
+
+      /*
+       * Three tiers, because Overpass cannot be relied on at request time.
+       *
+       * It rate-limits per client IP by CONCURRENCY, not by rate: ~2
+       * simultaneous queries, with the overflow answered by HTTP 406 in half a
+       * second. Every Worker request shares one IP. Measured under load, only
+       * 2 of 8 concurrent cold cities came back at all.
+       *
+       * But buildings don't move. So the question isn't "can Overpass answer
+       * this request" — it's "has Overpass ever answered for this area". R2
+       * makes that distinction real:
+       *
+       *   1. Edge cache — same colo, same area, ~200ms.
+       *   2. R2 — anywhere in the world has already asked. Permanent.
+       *   3. Overpass — the first person ever to look at this spot.
+       *
+       * A launch-day traffic spike hits tier 3 exactly once per area.
+       */
+      const hit = await cache.match(cacheKey)
+      if (hit) {
+        const r = new Response(hit.body, hit)
+        r.headers.set('x-cache', 'edge')
         return r
       }
 
-      const dLat = radius / 111320
-      const dLon = radius / (111320 * Math.cos((qLat * Math.PI) / 180))
-      const bbox = [
-        (qLat - dLat).toFixed(6),
-        (qLon - dLon).toFixed(6),
-        (qLat + dLat).toFixed(6),
-        (qLon + dLon).toFixed(6),
-      ].join(',')
-      const query =
-        `[out:json][timeout:25];(way["building"](${bbox});relation["building"](${bbox}););out geom;`
-
-      const MIRRORS = [
-        'https://overpass-api.de/api/interpreter',
-        'https://overpass.private.coffee/api/interpreter',
-        'https://overpass.kumi.systems/api/interpreter',
-      ]
-
-      for (const endpoint of MIRRORS) {
-        try {
-          const upstream = await fetch(endpoint, {
-            method: 'POST',
-            body: 'data=' + encodeURIComponent(query),
-            headers: {
-              // Overpass will not parse the body without this. Worker fetch
-              // defaults a string body to text/plain, which the server accepts
-              // and then fails to read — returning a 504 that looks like a
-              // timeout rather than the malformed request it actually is.
-              'Content-Type': 'application/x-www-form-urlencoded',
-              'User-Agent': 'geography-globe (+https://geography-globe.op0.workers.dev)',
-            },
-            signal: AbortSignal.timeout(20_000),
-          })
-          if (!upstream.ok) continue
-          const body = await upstream.text()
-
-          const res = new Response(body, {
-            headers: {
-              'content-type': 'application/json; charset=utf-8',
-              // A day at the edge, a week stale-while-revalidate. Buildings do
-              // not move, and serving a slightly old footprint beats serving
-              // nothing while Overpass is down.
-              'cache-control': 'public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800, stale-if-error=604800',
-              'access-control-allow-origin': '*',
-              'x-cache': 'miss',
-            },
-          })
+      if (env.BUILDINGS) {
+        const stored = await env.BUILDINGS.get(r2Key)
+        if (stored) {
+          const res = new Response(stored.body, { headers: headers('r2') })
           ctx.waitUntil(cache.put(cacheKey, res.clone()))
           return res
-        } catch {
-          // Try the next mirror.
         }
       }
 
-      // Every mirror failed. Say so explicitly — the client must be able to
-      // tell this apart from "no buildings here", because the shading answer
-      // is wrong in a different way in each case.
-      return jsonResponse({ error: 'upstream unavailable', elements: [] }, 503)
+      const result = await fetchBuildingArea(qLat, qLon, radius)
+
+      if (result.ok) {
+        const res = new Response(result.body, { headers: headers('miss') })
+        ctx.waitUntil(cache.put(cacheKey, res.clone()))
+        if (env.BUILDINGS) {
+          ctx.waitUntil(
+            env.BUILDINGS.put(r2Key, result.body, {
+              httpMetadata: { contentType: 'application/json' },
+            }).catch((e) => {
+              console.error('R2 put failed', r2Key, String(e))
+            }),
+          )
+        }
+        return res
+      }
+
+      /*
+       * Overpass didn't answer. Before giving up, check whether R2 has a
+       * WIDER radius for this spot — a 700m result contains everything a 300m
+       * one would, so it's a strictly better answer, not a fallback.
+       */
+      if (env.BUILDINGS && radius < 700) {
+        const wider = await env.BUILDINGS.get(`v1/${qLat.toFixed(3)},${qLon.toFixed(3)}/700.json`)
+        if (wider) {
+          return new Response(wider.body, { headers: headers('r2-wider') })
+        }
+      }
+
+      // Distinguish "busy, try again" from "genuinely unavailable" — the
+      // client retries the first and gives up on the second, and the UI says
+      // something different for each.
+      return jsonResponse(
+        {
+          error: result.rateLimited ? 'rate limited upstream' : 'upstream unavailable',
+          retryable: result.rateLimited,
+          elements: [],
+        },
+        result.rateLimited ? 429 : 503,
+      )
     }
 
     if (url.pathname === '/AGENTS.md' || url.pathname === '/agents.md') {
