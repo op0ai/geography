@@ -227,8 +227,23 @@ answer is to ask once instead of asking harder:
    Permanent; buildings don't move.
 3. **Overpass** — only the first person ever to look at this spot.
 
-`scripts/seed-buildings.mjs` pre-populates tiers 1-2 for the curated places,
-serially with a 2.5s pause. Run it before any launch or traffic event.
+`scripts/seed-cache.mjs` pre-populates tiers 1-2 for the curated places —
+**both** the building and vegetation layers, at both radii, serially with a
+2.5s pause between every query. 184 requests, ~25 minutes. Run it before any
+launch or traffic event.
+
+The two layers are separate Overpass queries against separate cache keys, so
+warming one does nothing for the other; a place with cached buildings and cold
+trees still stalls when someone lands there. `--only=vegetation` re-runs a
+single layer.
+
+**Changing the R2 key format orphans the entire cache.** The key gained a
+`{kind}` segment when vegetation was added — `v1/{lat,lon}/{r}.json` became
+`v1/buildings/{lat,lon}/{r}.json` — which silently stranded all 92 previously
+seeded objects and made every location cold again. The storage cost is
+negligible, but the re-seed is ~25 minutes against a service that allows two
+concurrent queries. If a key ever needs changing again, migrate the objects or
+accept the re-seed deliberately rather than discovering it as timeouts.
 
 **Do NOT add a background prefetch.** Warming the 700m query inside
 `ctx.waitUntil` after serving a 300m one is the obvious next idea and it makes
