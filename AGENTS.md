@@ -237,6 +237,13 @@ warming one does nothing for the other; a place with cached buildings and cold
 trees still stalls when someone lands there. `--only=vegetation` re-runs a
 single layer.
 
+**The client timeout must exceed the Worker's retry budget.** When a client
+aborts, the Worker's request is cancelled with it — so a timeout that fires
+mid-retry doesn't just report a failure, it *discards the work* and leaves the
+cache cold. A seeding run at 70s recorded a third of its queries as failures
+while Overpass was answering fine. The Worker now caps at two passes (~76s
+worst case) and the seeder waits 100s.
+
 **Changing the R2 key format orphans the entire cache.** The key gained a
 `{kind}` segment when vegetation was added — `v1/{lat,lon}/{r}.json` became
 `v1/buildings/{lat,lon}/{r}.json` — which silently stranded all 92 previously

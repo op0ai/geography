@@ -34,6 +34,21 @@ const DRY = process.argv.includes('--dry')
 
 /** Rate limit is 2 concurrent; one at a time with a pause is well inside it. */
 const PAUSE_MS = 2500
+
+/**
+ * Must exceed the Worker's own retry budget (~76s worst case across two
+ * passes and three mirrors).
+ *
+ * This is not a detail. When the client aborts, the Worker's request is
+ * cancelled with it — so a client timeout firing while the Worker is still
+ * retrying doesn't merely report a failure, it *throws the work away* and
+ * leaves the cache cold. An earlier run at 70s recorded a third of its queries
+ * as failures while Overpass was answering fine, and seeded nothing for them.
+ *
+ * Better to wait out one slow query than to spend 45 seconds achieving
+ * nothing.
+ */
+const TIMEOUT_MS = 100_000
 const RADII = [300, 700]
 
 /**
@@ -147,7 +162,7 @@ for (const [name, lat, lon] of PLACES) {
 
       const t0 = Date.now()
       try {
-        const res = await fetch(url, { signal: AbortSignal.timeout(70_000) })
+        const res = await fetch(url, { signal: AbortSignal.timeout(TIMEOUT_MS) })
         const source = res.headers.get('x-cache') ?? '?'
         const ms = Date.now() - t0
 

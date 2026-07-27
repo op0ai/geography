@@ -332,10 +332,24 @@ async function fetchBuildingArea(
     'https://overpass.private.coffee/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
   ]
+  /*
+   * Two passes, not three.
+   *
+   * Three passes across three mirrors, at up to 18s and 12s each plus a
+   * backoff, adds up to a worst case near 128 seconds. Nothing waits that
+   * long: browsers give up, the seeder gave up at 70s, and — crucially — when
+   * the client aborts, the Worker's own request is cancelled with it, so all
+   * that patient retrying is thrown away without ever reaching the cache. The
+   * result was a run where a third of the queries "failed" while the upstream
+   * was working fine.
+   *
+   * Two passes caps the worst case around 60s, which is inside what a client
+   * will actually wait for, so the work finishes and gets cached.
+   */
   const PASSES =
     kind === 'vegetation'
-      ? [vegetation, vegetationLite, vegetationLite]
-      : [withRelations, waysOnly, waysOnly]
+      ? [vegetation, vegetationLite]
+      : [withRelations, waysOnly]
 
   let rateLimited = false
 
@@ -355,7 +369,10 @@ async function fetchBuildingArea(
           },
           // Measured: central Berlin takes ~9s cold with no contention, so a
           // 12s ceiling was cutting off requests that were about to succeed.
-          signal: AbortSignal.timeout(attempt === 0 ? 18_000 : 12_000),
+          // 15s on the full query, 10s on the cheaper retry — two passes over
+          // three mirrors then caps at ~60s total, inside any client's
+          // patience.
+          signal: AbortSignal.timeout(attempt === 0 ? 15_000 : 10_000),
         })
 
         if (upstream.status === 406 || upstream.status === 429) {
