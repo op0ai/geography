@@ -11,6 +11,8 @@ import { Suspense, useMemo, useRef, useEffect, useState } from 'react'
 import { Canvas, useFrame, useThree } from '@react-three/fiber'
 import { OrbitControls, Stars } from '@react-three/drei'
 import * as THREE from 'three'
+import { deviceProfile } from '../lib/device'
+import { ContextGuard, type ContextStatus } from './ContextGuard'
 import { Globe } from './Globe'
 import { GroundScene, loadGround, SCENE_RADIUS, type GroundData } from './Ground'
 import { LookControls } from './LookControls'
@@ -48,6 +50,10 @@ interface SceneProps {
   onGroundState?: (s: GroundState) => void
   /** where the viewer is looking in ground mode, for the on-screen compass */
   onLook?: (s: { yaw: number; pitch: number }) => void
+  /** WebGL context health — drives the recovery notice */
+  onContextStatus?: (s: ContextStatus) => void
+  /** live coordinate under the cursor on the globe */
+  onHover?: (c: { lat: number; lon: number } | null) => void
 }
 
 export type GroundState =
@@ -59,6 +65,10 @@ export type GroundState =
       elevation: number
       empty: boolean
       buildingsFailed: boolean
+      /** how many building heights were guessed from storey counts */
+      estimated: number
+      /** the loaded scene, so the shading engine can raytrace against it */
+      data: GroundData
     }
   | { status: 'error'; message: string }
 
@@ -307,7 +317,12 @@ export function Scene({
   onModeChange,
   onGroundState,
   onLook,
+  onContextStatus,
+  onHover,
 }: SceneProps) {
+  // Read once — the answer can't change mid-session, and probing creates a
+  // throwaway GL context we don't want to make on every render.
+  const dev = useMemo(() => deviceProfile(), [])
   const controlsRef = useRef<any>(null)
   // Field of view is the ground-mode zoom, and LookControls reads it to scale
   // drag sensitivity.
@@ -361,6 +376,8 @@ export function Scene({
           elevation: g.originHeight,
           empty: g.empty,
           buildingsFailed: g.buildingsFailed,
+          estimated: g.buildings.filter((b) => b.estimated).length,
+          data: g,
         })
       })
       .catch((e) => {
@@ -377,17 +394,38 @@ export function Scene({
     <Canvas
       camera={{ position: [0, 1.2, 4.1], fov: 36, near: 0.1, far: 100 }}
       gl={{
-        antialias: true,
+        // MSAA is off on mobile: it multiplies the size of every render buffer
+        // at exactly the moment we're trying to stay under a memory ceiling.
+        antialias: dev.antialias,
         alpha: true,
+        // On mobile, asking for the high-performance GPU asks for the one that
+        // drains the battery and runs hot — and thermal throttling on iOS
+        // manifests as the context being taken away. A desktop with a discrete
+        // GPU genuinely benefits, so this is split rather than picked once.
+        powerPreference: dev.isAppleMobile ? 'low-power' : 'high-performance',
+        failIfMajorPerformanceCaveat: false,
         toneMapping: THREE.ACESFilmicToneMapping,
         // Exposure was compounding with the shader's own brightness, blowing
         // the day side to pure white. The shader already scales by irradiance;
         // this only needs to lift the very dim outer planets.
         toneMappingExposure: 0.92 + Math.min(0.22, (1 - Math.min(1, brightness)) * 0.22),
       }}
-      shadows
-      dpr={[1, 2]}
+      shadows={dev.tier > 1024}
+      // Was [1, 2] on every device. On a 3x phone that renders 9 pixels for
+      // every CSS pixel, on top of the texture cost, which is what pushed iOS
+      // over its limit.
+      dpr={[1, dev.maxDpr]}
+      onCreated={({ gl }) => {
+        // A lost context that isn't preventDefault()ed is gone for good. three
+        // handles this internally, but only from the moment it's listening.
+        gl.domElement.addEventListener(
+          'webglcontextlost',
+          (e) => e.preventDefault(),
+          false,
+        )
+      }}
     >
+      <ContextGuard onStatus={onContextStatus} />
       <ambientLight intensity={isGround ? 0 : 0.055} />
 
       {!isGround && (
@@ -402,6 +440,7 @@ export function Scene({
               cloudOpacity={cloudOpacity}
               lightScale={brightness}
               surfaceTexture={surfaceTexture}
+              onHover={onHover}
               atmosphereTint={atmosphereTint}
               hasAtmosphere={hasAtmosphere}
             />

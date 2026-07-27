@@ -11,6 +11,7 @@ import { useState, useMemo, useEffect, useCallback, useRef } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import { Scene, type GroundState } from './components/Scene'
 import { Descent, type Phase as DescentPhase } from './components/Descent'
+import { ContextNotice, type ContextStatus } from './components/ContextGuard'
 import { PlanetBar } from './components/PlanetBar'
 import { Stat, SkyDome, DayBand, TimeRow } from './components/Readout'
 import { SunOrb, FlowNumber, PhasePill, TimeScrubber } from './components/adopted'
@@ -49,6 +50,14 @@ import {
 } from './lib/places'
 import { geocode, reverseGeocode, type GeoResult } from './lib/geocode'
 import { decodeState, syncUrl, shareUrl } from './lib/urlstate'
+import {
+  buildPrisms,
+  sunHoursForDay,
+  sunHoursForYear,
+  type OcclusionScene,
+  type SunHourResult,
+} from './lib/sunhours'
+import { SunHoursPanel, SunHoursButton } from './components/SunHours'
 
 const hexToRgb01 = (hex: string): [number, number, number] => {
   const n = parseInt(hex.slice(1), 16)
@@ -108,6 +117,19 @@ export default function App() {
   // Mirror of groundState.status for the descent timer to poll — reading state
   // directly inside an interval would capture a stale closure.
   const readyRef = useRef<GroundState['status']>('idle')
+  // Coordinate under the cursor. Aiming at a sphere with no readout is
+  // guesswork — you find out where you landed only after you've landed.
+  const [hover, setHover] = useState<{ lat: number; lon: number } | null>(null)
+  const [contextStatus, setContextStatus] = useState<ContextStatus>('ok')
+  // The shading answer for the current spot. Null until we're on the ground
+  // and the terrain has arrived — there's nothing to raytrace against before.
+  const [sunHours, setSunHours] = useState<SunHourResult | null>(null)
+  const [sunHoursYear, setSunHoursYear] = useState<
+    { date: Date; directHours: number; daylightHours: number }[] | null
+  >(null)
+  const [shadingOpen, setShadingOpen] = useState(false)
+  const [computing, setComputing] = useState(false)
+  const [yearComputing, setYearComputing] = useState(false)
 
   const isEarth = planet.id === 'earth'
 
@@ -209,6 +231,81 @@ export default function App() {
   useEffect(() => {
     readyRef.current = groundState.status
   }, [groundState.status])
+
+  /* ---------------- how much sun does this spot get ----------------
+   *
+   * The headline feature. Everything else reports where the sun is; this
+   * reports whether it reaches *you*, given the buildings and hills that are
+   * actually there.
+   *
+   * Only meaningful once the ground scene has loaded, because that's when we
+   * have a height field and building footprints to trace against. Runs off
+   * the same data the renderer uses, but through a pure geometric path rather
+   * than the GPU, so the answer doesn't depend on what happens to be drawn.
+   */
+  const occlusion = useMemo<OcclusionScene | null>(() => {
+    if (groundState.status !== 'ready') return null
+    const g = groundState.data
+    return {
+      frame: g.frame,
+      hf: g.heightField,
+      prisms: buildPrisms(g.buildings, g.frame, g.heightField, g.originHeight),
+      originHeight: g.originHeight,
+      radius: 700,
+      // Standing height. The difference between this and ground level matters
+      // in dense streets, where a metre of elevation can clear a parapet.
+      eyeHeight: 1.6,
+    }
+  }, [groundState])
+
+  // Recompute the day whenever the place or the date changes. Debounced,
+  // because scrubbing the timeline would otherwise fire hundreds of traces.
+  useEffect(() => {
+    if (!occlusion || !isEarth) {
+      setSunHours(null)
+      return
+    }
+    let cancelled = false
+    setComputing(true)
+    const id = setTimeout(() => {
+      const r = sunHoursForDay(occlusion, coord.lat, coord.lon, date, 10)
+      if (!cancelled) {
+        setSunHours(r)
+        setComputing(false)
+      }
+    }, 120)
+    return () => {
+      cancelled = true
+      clearTimeout(id)
+      setComputing(false)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [occlusion, coord.lat, coord.lon, dayKey, isEarth])
+
+  // The year is thousands of rays, so it's opt-in and yields between chunks
+  // rather than blocking the frame.
+  const computeYear = useCallback(() => {
+    if (!occlusion) return
+    setYearComputing(true)
+    // Defer past the paint so the button's state change lands first.
+    setTimeout(() => {
+      const y = sunHoursForYear(
+        occlusion,
+        coord.lat,
+        coord.lon,
+        date.getUTCFullYear(),
+        5,
+        20,
+      )
+      setSunHoursYear(y)
+      setYearComputing(false)
+    }, 30)
+  }, [occlusion, coord.lat, coord.lon, date])
+
+  // A new location invalidates the year — it's specific to this skyline.
+  useEffect(() => {
+    setSunHoursYear(null)
+  }, [coord.lat, coord.lon])
 
   const sky = useMemo(
     () => (weather ? sliceAt(weather, date) : null),
@@ -409,10 +506,54 @@ export default function App() {
     setTimeout(() => setCopied(false), 1800)
   }, [coord, date, planet.id, viewMode, place])
 
+  /**
+   * Clicking the globe.
+   *
+   * This used to check the 40 curated places and, finding nothing within
+   * 220km, show "Somewhere" — which is most of the planet. reverseGeocode()
+   * already existed and was simply never called.
+   *
+   * Now it names the point optimistically from the local list (instant, no
+   * flash of "Somewhere"), then asks the geocoder what's actually there and
+   * upgrades the label when the answer lands. Over ocean the geocoder returns
+   * nothing, so we fall back to a genuine description rather than a shrug.
+   */
+  const pickSeq = useRef(0)
   const pick = useCallback((lat: number, lon: number) => {
     setCoord({ lat, lon })
+
     const { place: near, km } = nearestPlace(lat, lon)
-    setPlace(km < 220 ? near : null)
+    const seq = ++pickSeq.current
+
+    // Immediate, honest placeholder: the nearest known place if we're close,
+    // otherwise a bearing-and-distance description of where this actually is.
+    setPlace(
+      km < 25
+        ? near
+        : {
+            name: 'Locating…',
+            country: formatCoord(lat, lon),
+            lat,
+            lon,
+          },
+    )
+
+    reverseGeocode(lat, lon).then((r) => {
+      // A later click wins — otherwise a slow lookup can overwrite a newer pin.
+      if (seq !== pickSeq.current) return
+      if (r) {
+        setPlace({ name: r.name, country: r.country, lat, lon })
+      } else {
+        // Genuinely nothing mapped here — usually open ocean. Say which ocean
+        // and how far from the nearest named place, which is real information.
+        setPlace({
+          name: oceanName(lat, lon),
+          country: `${Math.round(km)} km from ${near.name}`,
+          lat,
+          lon,
+        })
+      }
+    })
   }, [])
 
   const choose = useCallback((r: GeoResult) => {
@@ -429,8 +570,12 @@ export default function App() {
     setShowSearch(false)
   }, [])
 
-  const label = place ? place.name : 'Somewhere'
-  const sublabel = place ? place.country : formatCoord(coord.lat, coord.lon)
+  // Never "Somewhere". Every point on Earth has a name or, failing that, a
+  // coordinate — both of which are more informative than a shrug.
+  const label = place ? place.name : formatCoord(coord.lat, coord.lon)
+  const sublabel = place
+    ? place.country
+    : `${Math.abs(coord.lat) < 23.44 ? 'Tropics' : Math.abs(coord.lat) > 66.56 ? 'Polar' : 'Temperate'} · unnamed`
 
   return (
     <div className="fixed inset-0 bg-[var(--color-void)] text-[var(--color-ink)]">
@@ -470,7 +615,11 @@ export default function App() {
           }}
           onGroundState={setGroundState}
           onLook={setLook}
+          onHover={setHover}
+          onContextStatus={setContextStatus}
         />
+        <ContextNotice status={contextStatus} />
+        <HoverHint coord={hover} visible={viewMode === 'globe'} />
       </div>
 
       {/* gradient scrim so panels stay legible over bright ocean */}
@@ -1040,6 +1189,47 @@ export default function App() {
         skyTint={phase.tint}
       />
 
+      {/* ---------------- the shading answer ----------------
+          The reason to use this over a sun-position table. Anchored bottom-left
+          in ground mode, where the terrain and buildings it traces against are
+          on screen behind it. */}
+      <AnimatePresence>
+        {viewMode === 'ground' && groundState.status === 'ready' && !shadingOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 8, transition: exit.moderate }}
+            transition={spring.moderate}
+            className="absolute left-6 bottom-6 z-20 pointer-events-none"
+          >
+            <SunHoursButton
+              hours={sunHours ? sunHours.directHours : null}
+              loading={computing && !sunHours}
+              degraded={groundState.buildingsFailed}
+              onClick={() => setShadingOpen(true)}
+            />
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {viewMode === 'ground' && groundState.status === 'ready' && shadingOpen && (
+          <div className="absolute left-6 bottom-6 z-20 pointer-events-none">
+            <SunHoursPanel
+              result={sunHours}
+              year={sunHoursYear}
+              computing={computing}
+              yearComputing={yearComputing}
+              onComputeYear={computeYear}
+              buildingsEstimated={groundState.estimated}
+              hadBuildings={groundState.buildings > 0}
+              buildingsFailed={groundState.buildingsFailed}
+              onClose={() => setShadingOpen(false)}
+            />
+          </div>
+        )}
+      </AnimatePresence>
+
       {/* Where you're looking. Only in ground mode, where the camera can
           point anywhere — including straight up, which is the whole reason
           this control scheme exists. */}
@@ -1541,6 +1731,30 @@ function Note({ children }: { children: React.ReactNode }) {
  * Which way the sun is from where you're facing. "Sun ahead" beats making the
  * user subtract two bearings in their head.
  */
+/**
+ * Which ocean a point sits in, roughly.
+ *
+ * When the geocoder returns nothing it's almost always open water. "Somewhere"
+ * is a shrug; "South Pacific Ocean, 1,840 km from Auckland" is information.
+ * Boundaries are the conventional ones, simplified — good enough to name the
+ * water you're looking at.
+ */
+function oceanName(lat: number, lon: number): string {
+  if (lat < -60) return 'Southern Ocean'
+  if (lat > 66.5) return 'Arctic Ocean'
+
+  // Normalise to -180..180
+  const L = ((((lon + 180) % 360) + 360) % 360) - 180
+
+  if (L > 20 && L < 147) {
+    return lat > 0 ? 'Indian Ocean' : 'Indian Ocean'
+  }
+  if (L >= 147 || L < -70) {
+    return lat > 0 ? 'North Pacific Ocean' : 'South Pacific Ocean'
+  }
+  return lat > 0 ? 'North Atlantic Ocean' : 'South Atlantic Ocean'
+}
+
 function sunRelative(facing: number, sunAz: number) {
   let d = ((sunAz - facing + 540) % 360) - 180
   const a = Math.abs(d)
@@ -1583,4 +1797,62 @@ function setDayOfYear(d: Date, doy: number) {
   next.setUTCMonth(0, 1)
   next.setUTCDate(doy + 1)
   return next
+}
+
+/**
+ * HoverHint — the coordinate under the cursor, and what the sun is doing there.
+ *
+ * Two problems this solves at once. First, aiming: the globe is a smooth
+ * sphere and without a readout you cannot tell whether you're over Lyon or
+ * Turin until you've already committed. Second, discoverability: nothing on
+ * screen previously suggested the globe was clickable at all.
+ *
+ * It follows the pointer in screen space rather than being anchored in 3D,
+ * because a label welded to the sphere rotates with it and ends up upside down
+ * near the poles. Placed below-right of the cursor so it never sits under the
+ * fingertip on touch — where it would be invisible anyway.
+ */
+function HoverHint({
+  coord,
+  visible,
+}: {
+  coord: { lat: number; lon: number } | null
+  visible: boolean
+}) {
+  const [pos, setPos] = useState({ x: 0, y: 0 })
+
+  useEffect(() => {
+    if (!coord) return
+    const onMove = (e: PointerEvent) => setPos({ x: e.clientX, y: e.clientY })
+    window.addEventListener('pointermove', onMove)
+    return () => window.removeEventListener('pointermove', onMove)
+  }, [coord])
+
+  // Touch devices have no hover; the reticle and ripple carry the feedback
+  // there instead.
+  const fine = useMemo(
+    () =>
+      typeof window !== 'undefined' &&
+      window.matchMedia?.('(pointer: fine)').matches,
+    [],
+  )
+
+  if (!coord || !visible || !fine) return null
+
+  return (
+    <div
+      className="pointer-events-none fixed z-40 select-none"
+      style={{ left: pos.x + 16, top: pos.y + 16 }}
+      aria-hidden
+    >
+      <div className="rounded-lg border border-white/10 bg-black/70 px-2.5 py-1.5 backdrop-blur-md">
+        <div className="font-mono text-[11px] leading-tight text-white/85 tabular-nums">
+          {formatCoord(coord.lat, coord.lon)}
+        </div>
+        <div className="mt-0.5 text-[10px] leading-tight text-white/45">
+          Click to place the pin
+        </div>
+      </div>
+    </div>
+  )
 }

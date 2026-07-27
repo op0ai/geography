@@ -11,7 +11,7 @@
     // straight from index.html and the per-view OG rewrite never ran. These
     // routes must reach the Worker first; everything else (hashed JS/CSS,
     // textures, icons) still goes straight to the asset server.
-    "run_worker_first": ["/", "/index.html", "/og.png", "/og.svg", "/llms.txt", "/robots.txt", "/.well-known/*"]
+    "run_worker_first": ["/", "/index.html", "/og.png", "/og.svg", "/llms.txt", "/robots.txt", "/.well-known/*", "/api/*"]
   },
   "observability": { "enabled": true }
 }

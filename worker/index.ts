@@ -33,10 +33,23 @@ const esc = (s: string) =>
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;')
 
+/**
+ * The default view. Must stay in sync with DEFAULT_PLACE in src/lib/places.ts —
+ * a bare URL previously fell back to Tromsø's *coordinates* with an empty name,
+ * so the homepage shared as "69.65°, 18.96°" instead of "Tromsø". The name has
+ * to live here too; the Worker can't import from src.
+ */
+const DEFAULT_VIEW = {
+  lat: 69.6492,
+  lon: 18.9553,
+  name: 'Tromsø',
+  country: 'Norway',
+}
+
 function parseView(url: URL) {
   const at = url.searchParams.get('at')
-  let lat = 69.6492
-  let lon = 18.9553
+  let lat = DEFAULT_VIEW.lat
+  let lon = DEFAULT_VIEW.lon
   if (at) {
     const [la, lo] = at.split(',').map(Number)
     if (isFinite(la) && isFinite(lo) && Math.abs(la) <= 90 && Math.abs(lo) <= 180) {
@@ -46,8 +59,11 @@ function parseView(url: URL) {
   }
   const tRaw = url.searchParams.get('t')
   const t = tRaw && !isNaN(Date.parse(tRaw)) ? new Date(tRaw) : new Date()
-  const name = (url.searchParams.get('name') || '').slice(0, 60)
-  const country = (url.searchParams.get('in') || '').slice(0, 60)
+  // Only inherit the default name when the coordinate is also the default —
+  // otherwise a shared pin with no ?name would be mislabelled "Tromsø".
+  const atDefault = !at
+  const name = (url.searchParams.get('name') || (atDefault ? DEFAULT_VIEW.name : '')).slice(0, 60)
+  const country = (url.searchParams.get('in') || (atDefault ? DEFAULT_VIEW.country : '')).slice(0, 60)
   const planet = (url.searchParams.get('on') || 'earth').slice(0, 20)
   const ground = url.searchParams.has('ground')
   return { lat, lon, t, name, country, planet, ground }
@@ -190,8 +206,20 @@ function metaFor(v: ReturnType<typeof parseView>, url: URL) {
 
 /* ------------------------------------------------------------------ */
 
+/** Small JSON responder for the API routes. */
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      'access-control-allow-origin': '*',
+      'cache-control': 'no-store',
+    },
+  })
+}
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
 
     /* ---- dynamic OG image ----
@@ -307,6 +335,111 @@ export default {
     // Foundation). llms.txt says what the site IS; AGENTS.md says how to work
     // on it. Both belong on the wire: an agent sent to contribute shouldn't
     // have to clone the repo to learn that the astronomy is test-verified.
+    /* --------------------------------------------------------------
+     * /api/buildings — an edge proxy for Overpass.
+     *
+     * Three problems with calling Overpass from the browser, all of which
+     * showed up in testing:
+     *
+     *   1. It's slow. The reference mirror routinely takes 10-40s under load,
+     *      and the ground scene sits on "Loading…" the whole time.
+     *   2. It's rate-limited per client IP. A front-page traffic spike means
+     *      every visitor gets throttled, and the feature that makes this app
+     *      worth using is the first thing to break.
+     *   3. Its failure mode is indistinguishable from success. An empty result
+     *      means either "nothing is mapped here" or "the mirror gave up", and
+     *      the shading answer is completely different in those two cases.
+     *
+     * Proxying through the edge fixes all three. Cloudflare's cache collapses
+     * concurrent requests for the same tile into one upstream call, so a
+     * thousand people looking at the same city is one Overpass query. The
+     * cache key is rounded to ~100m, which is well inside the 700m scene
+     * radius, so neighbours share an entry.
+     * ------------------------------------------------------------------ */
+    if (url.pathname === '/api/buildings') {
+      const lat = Number(url.searchParams.get('lat'))
+      const lon = Number(url.searchParams.get('lon'))
+      const radius = Math.min(2000, Number(url.searchParams.get('r')) || 700)
+      if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+        return jsonResponse({ error: 'bad coordinates' }, 400)
+      }
+
+      // Round the cache key so nearby requests share an entry. 0.001° is
+      // ~111m north-south — small relative to the scene, large enough to
+      // collapse the traffic from everyone looking at the same landmark.
+      const qLat = Math.round(lat * 1000) / 1000
+      const qLon = Math.round(lon * 1000) / 1000
+      const cacheUrl = new URL(url)
+      cacheUrl.search = `?lat=${qLat}&lon=${qLon}&r=${radius}`
+      const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' })
+      const cache = caches.default
+
+      const cached = await cache.match(cacheKey)
+      if (cached) {
+        const r = new Response(cached.body, cached)
+        r.headers.set('x-cache', 'hit')
+        return r
+      }
+
+      const dLat = radius / 111320
+      const dLon = radius / (111320 * Math.cos((qLat * Math.PI) / 180))
+      const bbox = [
+        (qLat - dLat).toFixed(6),
+        (qLon - dLon).toFixed(6),
+        (qLat + dLat).toFixed(6),
+        (qLon + dLon).toFixed(6),
+      ].join(',')
+      const query =
+        `[out:json][timeout:25];(way["building"](${bbox});relation["building"](${bbox}););out geom;`
+
+      const MIRRORS = [
+        'https://overpass-api.de/api/interpreter',
+        'https://overpass.private.coffee/api/interpreter',
+        'https://overpass.kumi.systems/api/interpreter',
+      ]
+
+      for (const endpoint of MIRRORS) {
+        try {
+          const upstream = await fetch(endpoint, {
+            method: 'POST',
+            body: 'data=' + encodeURIComponent(query),
+            headers: {
+              // Overpass will not parse the body without this. Worker fetch
+              // defaults a string body to text/plain, which the server accepts
+              // and then fails to read — returning a 504 that looks like a
+              // timeout rather than the malformed request it actually is.
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'User-Agent': 'geography-globe (+https://geography-globe.op0.workers.dev)',
+            },
+            signal: AbortSignal.timeout(20_000),
+          })
+          if (!upstream.ok) continue
+          const body = await upstream.text()
+
+          const res = new Response(body, {
+            headers: {
+              'content-type': 'application/json; charset=utf-8',
+              // A day at the edge, a week stale-while-revalidate. Buildings do
+              // not move, and serving a slightly old footprint beats serving
+              // nothing while Overpass is down.
+              'cache-control': 'public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800, stale-if-error=604800',
+              'access-control-allow-origin': '*',
+              'x-cache': 'miss',
+            },
+          })
+          ctx.waitUntil(cache.put(cacheKey, res.clone()))
+          return res
+        } catch {
+          // Try the next mirror.
+        }
+      }
+
+      // Every mirror failed. Say so explicitly — the client must be able to
+      // tell this apart from "no buildings here", because the shading answer
+      // is wrong in a different way in each case.
+      return jsonResponse({ error: 'upstream unavailable', elements: [] }, 503)
+    }
+
     if (url.pathname === '/AGENTS.md' || url.pathname === '/agents.md') {
       const res = await env.ASSETS.fetch(
         new Request(new URL('/AGENTS.md', url.origin), request),

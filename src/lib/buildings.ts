@@ -90,6 +90,20 @@ function baseFor(tags: Record<string, string>): number {
  * one verified working from the browser; private.coffee explicitly permits
  * production use and is the first fallback.
  */
+/**
+ * Direct Overpass mirrors, used only as a fallback.
+ *
+ * The primary path is `/api/buildings`, our own edge proxy — Cloudflare caches
+ * the response and collapses concurrent requests for the same area into one
+ * upstream query. That matters because Overpass rate-limits per client IP, so
+ * without the proxy a traffic spike means every visitor gets throttled and the
+ * shading feature silently degrades to "no buildings here".
+ *
+ * These stay as a fallback for local development, where there's no Worker in
+ * front, and for the case where our own edge is having a bad day.
+ */
+const PROXY = '/api/buildings'
+
 const ENDPOINTS = [
   'https://overpass-api.de/api/interpreter',
   'https://overpass.private.coffee/api/interpreter',
@@ -140,6 +154,28 @@ export async function fetchBuildings(
   // mirror against a deadline and move on.
   const PER_MIRROR_MS = 12_000
 
+  // Try our edge proxy first: cached, deduplicated, and far faster than a
+  // cold Overpass query. Skipped when running against a dev server with no
+  // Worker in front of it, which returns the SPA's index.html for /api/*.
+  try {
+    const proxyUrl =
+      `${PROXY}?lat=${lat.toFixed(5)}&lon=${lon.toFixed(5)}&r=${Math.round(radiusMetres)}`
+    const res = await fetch(proxyUrl, {
+      signal: signal ?? AbortSignal.timeout(22_000),
+    })
+    if (res.ok && res.headers.get('content-type')?.includes('json')) {
+      const json = await res.json()
+      if (Array.isArray(json?.elements)) {
+        const out = parseOverpass(json)
+        cache.set(key, out)
+        lastFetchFailed = false
+        return out
+      }
+    }
+  } catch {
+    // Fall through to the direct mirrors.
+  }
+
   for (const endpoint of ENDPOINTS) {
     if (signal?.aborted) return []
     const timer = new AbortController()
@@ -151,6 +187,8 @@ export async function fetchBuildings(
     try {
       const res = await fetch(endpoint, {
         method: 'POST',
+        // Required — without it Overpass returns 504 on a body it can't parse.
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: 'data=' + encodeURIComponent(query),
         signal: timer.signal,
       })

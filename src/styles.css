@@ -14,6 +14,8 @@
 @source './components/Scene.tsx';
 @source './components/PlanetBar.tsx';
 @source './components/Readout.tsx';
+@source './components/SunHours.tsx';
+@source './components/ContextGuard.tsx';
 @source './components/adopted.tsx';
 @source './components/smoothui/siri-orb';
 @source './components/smoothui/scrubber';

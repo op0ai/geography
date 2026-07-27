@@ -8,7 +8,7 @@
     "build": "tsc -b --noCheck && vite build",
     "preview": "vite preview",
     "check": "tsc --noEmit",
-    "verify": "node scripts/verify-solar.mjs && node scripts/verify-terrain.mjs"
+    "verify": "node scripts/verify-solar.mjs && node scripts/verify-terrain.mjs && node scripts/verify-sunhours.mjs"
   },
   "dependencies": {
     "@radix-ui/react-popover": "^1.1.23",

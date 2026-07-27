@@ -7,9 +7,10 @@
  * curve is always right at every latitude and season — nobody computed it.
  */
 
-import { useRef, useMemo, useEffect, useLayoutEffect } from 'react'
+import { useRef, useMemo, useState, useEffect, useLayoutEffect } from 'react'
 import { useFrame, useLoader, type ThreeEvent } from '@react-three/fiber'
 import * as THREE from 'three'
+import { deviceProfile, textureUrl } from '../lib/device'
 import { latLonToVec3, vec3ToLatLon } from '../lib/solar'
 import { PLACES } from '../lib/places'
 
@@ -188,6 +189,8 @@ interface GlobeProps {
   /** the pinned location */
   marker: { lat: number; lon: number }
   onPick: (lat: number, lon: number) => void
+  /** cursor position over the globe, or null when off it */
+  onHover?: (c: { lat: number; lon: number } | null) => void
   /** 0 = no clouds, 1 = full */
   cloudOpacity?: number
   /** dim the whole globe when the sun is far away (other planets) */
@@ -200,10 +203,16 @@ interface GlobeProps {
   hasAtmosphere?: boolean
 }
 
+/** Max pointer travel, in pixels, that still counts as a tap rather than a drag. */
+const TAP_SLOP = 6
+/** Max press duration, in ms, that still counts as a tap. */
+const TAP_HOLD = 500
+
 export function Globe({
   subsolar,
   marker,
   onPick,
+  onHover,
   cloudOpacity = 1,
   lightScale = 1,
   surfaceTexture = '/textures/earth_day_4096.jpg',
@@ -214,10 +223,23 @@ export function Globe({
   const matRef = useRef<THREE.ShaderMaterial>(null)
   const atmoRef = useRef<THREE.ShaderMaterial>(null)
 
+  // Texture resolution is a device decision, not a constant. The 4096 set is
+  // 134 MB of GPU memory once decoded and mipmapped, which iOS Safari will not
+  // tolerate — it silently revokes the context and the canvas goes black. See
+  // lib/device.ts for the arithmetic. On a phone the globe is ~390px across and
+  // the 1024 tier is indistinguishable.
+  const dev = useMemo(() => deviceProfile(), [])
+  // The surface map arrives from the planet definition, so retier it here
+  // rather than making every caller device-aware. Planets that only ship one
+  // resolution (the Moon) pass through untouched.
+  const surface = useMemo(
+    () => surfaceTexture.replace('_4096', `_${dev.tier}`),
+    [surfaceTexture, dev.tier],
+  )
   const [dayMap, nightMap, packedMap] = useLoader(THREE.TextureLoader, [
-    surfaceTexture,
-    '/textures/earth_night_4096.jpg',
-    '/textures/earth_bump_roughness_clouds_4096.jpg',
+    surface,
+    textureUrl('earth_night', dev.tier),
+    textureUrl('earth_bump_roughness_clouds', dev.tier),
   ])
 
   // three r152+ is colour-managed. Albedo maps must be tagged sRGB; data maps
@@ -227,10 +249,12 @@ export function Globe({
     nightMap.colorSpace = THREE.SRGBColorSpace
     packedMap.colorSpace = THREE.NoColorSpace
     for (const t of [dayMap, nightMap, packedMap]) {
-      t.anisotropy = 8
+      // Anisotropic filtering is cheap on desktop and expensive on tile-based
+      // mobile GPUs, where it multiplies bandwidth per fragment.
+      t.anisotropy = dev.anisotropy
       t.needsUpdate = true
     }
-  }, [dayMap, nightMap, packedMap])
+  }, [dayMap, nightMap, packedMap, dev.anisotropy])
 
   const uniforms = useMemo(
     () => ({
@@ -297,20 +321,90 @@ export function Globe({
     }
   })
 
-  const handleClick = (e: ThreeEvent<MouseEvent>) => {
+  /**
+   * Picking a point on the globe.
+   *
+   * This used to fire on `pointerdown`, which meant every drag to rotate the
+   * globe also dropped a pin at wherever you happened to grab it. You could
+   * not spin the world without relocating yourself. That is the whole of the
+   * "pointing a place is bad UX" complaint.
+   *
+   * A pick is now a *tap*: press and release within 6 pixels and 500ms. Move
+   * further and it's a rotation; hold longer and it's a deliberate grab. The
+   * thresholds are the platform conventions — 6px is roughly what a steady
+   * hand produces on a trackpad, and generous enough for a fingertip.
+   */
+  const press = useRef<{ x: number; y: number; t: number; id: number } | null>(null)
+
+  const handleDown = (e: ThreeEvent<PointerEvent>) => {
+    // Don't stopPropagation here — OrbitControls needs this event to start a
+    // rotation. We're only recording where the press began.
+    press.current = { x: e.clientX, y: e.clientY, t: performance.now(), id: e.pointerId }
+  }
+
+  const handleUp = (e: ThreeEvent<PointerEvent>) => {
+    const p = press.current
+    press.current = null
+    if (!p || p.id !== e.pointerId || !meshRef.current) return
+
+    const moved = Math.hypot(e.clientX - p.x, e.clientY - p.y)
+    const held = performance.now() - p.t
+    if (moved > TAP_SLOP || held > TAP_HOLD) return // a rotation, not a pick
+
     e.stopPropagation()
-    if (!meshRef.current) return
     // Convert the world-space hit into the mesh's own frame first, so any
     // rotation on the globe doesn't corrupt the coordinate.
     const local = meshRef.current.worldToLocal(e.point.clone())
     const { lat, lon } = vec3ToLatLon(local.x, local.y, local.z)
     onPick(lat, lon)
+    // A tap that lands should feel like it landed. The ripple is drawn at the
+    // hit point and expires on its own.
+    setRipple({ pos: local.clone(), key: Date.now() })
   }
+
+  // Where the cursor is over the globe, in the mesh's own frame. Drives the
+  // hover reticle and the coordinate readout — without it you are aiming at an
+  // unlabelled sphere and hoping.
+  const [hover, setHover] = useState<THREE.Vector3 | null>(null)
+  const [ripple, setRipple] = useState<{ pos: THREE.Vector3; key: number } | null>(null)
+
+  const handleMove = (e: ThreeEvent<PointerEvent>) => {
+    if (!meshRef.current) return
+    // Suppress the reticle mid-drag: it's distracting, and the point under the
+    // cursor isn't where you'd land anyway once the globe has spun.
+    if (press.current && Math.hypot(e.clientX - press.current.x, e.clientY - press.current.y) > TAP_SLOP) {
+      setHover(null)
+      return
+    }
+    setHover(meshRef.current.worldToLocal(e.point.clone()))
+  }
+
+  const hoverCoord = useMemo(
+    () => (hover ? vec3ToLatLon(hover.x, hover.y, hover.z) : null),
+    [hover],
+  )
+
+  useEffect(() => {
+    onHover?.(hoverCoord)
+  }, [hoverCoord, onHover])
+
+  // Fingers have no hover state, so the reticle would stick after a tap.
+  useEffect(() => {
+    if (!ripple) return
+    const id = setTimeout(() => setRipple(null), 620)
+    return () => clearTimeout(id)
+  }, [ripple])
 
   return (
     <group>
       {/* the planet */}
-      <mesh ref={meshRef} onPointerDown={handleClick}>
+      <mesh
+        ref={meshRef}
+        onPointerDown={handleDown}
+        onPointerUp={handleUp}
+        onPointerMove={handleMove}
+        onPointerOut={() => setHover(null)}
+      >
         <sphereGeometry args={[GLOBE_RADIUS, 128, 128]} />
         <shaderMaterial
           ref={matRef}
@@ -334,6 +428,9 @@ export function Globe({
           blending={THREE.AdditiveBlending}
         />
       </mesh>
+
+      {hover && <HoverReticle position={hover} sunVec={sunVec} />}
+      {ripple && <PickRipple key={ripple.key} position={ripple.pos} />}
 
       <CityMarkers sunVec={sunVec} />
       <LocationMarker position={markerPos} lit={markerLit} />
@@ -528,3 +625,106 @@ function SubsolarMarker({ subsolar }: { subsolar: { lat: number; lon: number } }
 }
 
 export { GLOBE_RADIUS }
+
+/**
+ * HoverReticle — a small ring that tracks the cursor across the surface.
+ *
+ * Aiming at a featureless sphere with no feedback is guesswork; you press and
+ * find out afterwards where you actually landed. The ring sits a hair above
+ * the surface, oriented to the local tangent plane, so it reads as *on* the
+ * globe rather than floating in front of it.
+ *
+ * It dims on the night side, matching how the pin behaves, so the reticle
+ * never becomes the brightest thing on a dark hemisphere.
+ */
+function HoverReticle({
+  position,
+  sunVec,
+}: {
+  position: THREE.Vector3
+  sunVec: THREE.Vector3
+}) {
+  const ref = useRef<THREE.Group>(null)
+  const lit = position.clone().normalize().dot(sunVec) > -0.0145
+
+  // Sit fractionally proud of the surface. Any less and the sphere z-fights
+  // the ring; any more and it visibly hovers.
+  const p = useMemo(() => position.clone().multiplyScalar(1.004), [position])
+
+  useFrame(() => {
+    // Lay the ring flat against the sphere by pointing its local +Z along the
+    // surface normal, which for a unit sphere is just the position.
+    ref.current?.lookAt(
+      ref.current.position.clone().multiplyScalar(2),
+    )
+  })
+
+  return (
+    <group ref={ref} position={p}>
+      <mesh>
+        <ringGeometry args={[0.017, 0.023, 40]} />
+        <meshBasicMaterial
+          color={lit ? '#ffffff' : '#7cc4ff'}
+          transparent
+          opacity={lit ? 0.85 : 0.6}
+          side={THREE.DoubleSide}
+          depthWrite={false}
+        />
+      </mesh>
+      <mesh>
+        <circleGeometry args={[0.0035, 12]} />
+        <meshBasicMaterial
+          color={lit ? '#ffffff' : '#7cc4ff'}
+          transparent
+          opacity={0.9}
+          depthWrite={false}
+        />
+      </mesh>
+    </group>
+  )
+}
+
+/**
+ * PickRipple — the confirmation that a tap registered.
+ *
+ * One expanding, fading ring at the point of contact. It exists because a pin
+ * that simply appears elsewhere on screen doesn't tell you *your press* did
+ * it — especially on touch, where there's no cursor to connect the two. Runs
+ * ~600ms and unmounts itself.
+ */
+function PickRipple({ position }: { position: THREE.Vector3 }) {
+  const ref = useRef<THREE.Group>(null)
+  const mat = useRef<THREE.MeshBasicMaterial>(null)
+  const t = useRef(0)
+
+  const p = useMemo(() => position.clone().multiplyScalar(1.005), [position])
+
+  useFrame((_, delta) => {
+    t.current += delta
+    const k = Math.min(1, t.current / 0.6)
+    // Ease out — fast at the start, settling at the edge. A linear expansion
+    // reads as mechanical.
+    const e = 1 - Math.pow(1 - k, 3)
+    if (ref.current) {
+      ref.current.scale.setScalar(0.4 + e * 2.6)
+      ref.current.lookAt(ref.current.position.clone().multiplyScalar(2))
+    }
+    if (mat.current) mat.current.opacity = (1 - k) * 0.75
+  })
+
+  return (
+    <group ref={ref} position={p}>
+      <mesh>
+        <ringGeometry args={[0.018, 0.026, 40]} />
+        <meshBasicMaterial
+          ref={mat}
+          color="#ffffff"
+          transparent
+          opacity={0.75}
+          side={THREE.DoubleSide}
+          depthWrite={false}
+        />
+      </mesh>
+    </group>
+  )
+}
