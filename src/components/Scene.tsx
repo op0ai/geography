@@ -141,12 +141,35 @@ function ModeWatcher({
   onChange: (m: 'globe' | 'ground') => void
 }) {
   const { camera } = useThree()
+
+  /*
+   * A mode change repositions the camera, but not until the next effect runs —
+   * and this watcher polls every frame. Without a lockout it can observe the
+   * camera still holding the OLD mode's coordinates and immediately flip back,
+   * which is how a single scroll could ping-pong between globe and ground.
+   *
+   * A few frames of quiet after each change is all it takes: by then
+   * GroundCamera has written the new position and the reading is meaningful.
+   */
+  const settle = useRef(0)
+  const lastMode = useRef(mode)
+  if (lastMode.current !== mode) {
+    lastMode.current = mode
+    settle.current = 6
+  }
+
   useFrame(() => {
+    if (settle.current > 0) {
+      settle.current--
+      return
+    }
+
     if (!enabled) {
       if (mode === 'ground') onChange('globe')
       return
     }
     const d = camera.position.length()
+    if (!isFinite(d)) return
 
     // The two modes measure distance in completely different units — globe
     // radii (~1.5-7) versus metres (~40-2100). Comparing a ground-mode camera
@@ -154,7 +177,9 @@ function ModeWatcher({
     // bounces you back to orbit the moment you land. Each mode gets its own
     // exit test, in its own units.
     if (mode === 'globe') {
-      if (d < DESCEND_AT) onChange('ground')
+      // Only descend from a plausible orbit distance. A camera still carrying
+      // ground-mode metres is not "very close to the globe", it's nonsense.
+      if (d < DESCEND_AT && d > 0.5) onChange('ground')
     } else {
       // Pulling back past ~2.4 km means you've zoomed out of the scene.
       if (d > SCENE_RADIUS * 3.4) onChange('globe')
@@ -205,13 +230,36 @@ function GroundCamera({
 
   useEffect(() => {
     if (active) return
-    // Restore the globe camera's clipping planes on the way out, and place it
-    // clear of the descend threshold so we don't immediately fall back down.
+
+    /*
+     * Coming back up to the globe.
+     *
+     * The two modes measure space in incompatible units: the globe has radius
+     * 1 and the camera orbits at 1.5–7, while the ground scene is in metres
+     * and the camera sits ~430 out and 95 up. So the position left behind by
+     * ground mode is meaningless as a globe position and MUST be replaced.
+     *
+     * The original guard only rescued a camera that was too CLOSE (`< 3`),
+     * which handled the descent but not the ascent — a returning ground camera
+     * is at ~431, sails through the check untouched, and leaves you staring at
+     * a tiny Earth from 431 radii away with no way back in. That's the
+     * "just keep getting zoomed out" bug: zoom did nothing visible because
+     * OrbitControls clamps to maxDistance 7 while the camera was two orders of
+     * magnitude beyond it.
+     *
+     * Now anything outside the orbit range is pulled back to a sane distance,
+     * preserving only the DIRECTION so you return facing the place you left.
+     */
     camera.near = 0.1
     camera.far = 100
     ;(camera as THREE.PerspectiveCamera).fov = 36
-    if (camera.position.length() < 3) {
-      camera.position.normalize().multiplyScalar(4.1)
+
+    const d = camera.position.length()
+    if (d < 3 || d > 7 || !isFinite(d)) {
+      // A zero-length position can't be normalised; fall back to the default
+      // vantage rather than producing NaNs.
+      if (d < 1e-6 || !isFinite(d)) camera.position.set(0, 1.2, 4.1)
+      else camera.position.normalize().multiplyScalar(4.1)
     }
     camera.updateProjectionMatrix()
   }, [active, camera])
@@ -542,7 +590,12 @@ export function Scene({
           dampingFactor={0.06}
           rotateSpeed={0.45}
           zoomSpeed={0.7}
-          minDistance={1.5}
+          // Must sit BELOW DESCEND_AT (1.62) with room to spare, or the wheel
+          // stops at the clamp just short of the threshold and the descent
+          // never fires — you scroll and scroll and nothing happens. Damping
+          // means the camera approaches this floor asymptotically, so the gap
+          // has to be generous rather than marginal.
+          minDistance={1.35}
           maxDistance={7}
           target={[0, 0, 0]}
           enabled={!autoRotate}

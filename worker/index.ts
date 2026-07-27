@@ -14,6 +14,7 @@
 
 import { solarPosition, sunTimes, phaseFor } from '../src/lib/solar'
 import { Raster, text, measure, encodePng, hex } from './png'
+import { sampleCanopy } from './cog'
 
 interface Env {
   ASSETS: { fetch: (req: Request) => Promise<Response> }
@@ -581,6 +582,120 @@ export default {
      * cache key is rounded to ~100m, which is well inside the 700m scene
      * radius, so neighbours share an entry.
      * ------------------------------------------------------------------ */
+    /* --------------------------------------------------------------
+     * /api/canopy — global tree cover, for everywhere OSM has none.
+     *
+     * OpenStreetMap's 34 million mapped trees are concentrated in northern
+     * Europe: Germany has 4.07M for 84 million people, India 111k for 1.4
+     * billion. So the OSM vegetation layer improves the shading answer in
+     * Cologne and does nothing in Lagos, which is a real hole in a tool that
+     * claims to work anywhere.
+     *
+     * This reads Meta/WRI's global 1.19 m canopy height map, range-requested
+     * out of Cloud-Optimized GeoTIFFs on Source Cooperative (CC-BY-4.0, CORS
+     * enabled). A full tile is ~100 MB; we fetch the header plus the handful
+     * of 512×512 blocks the scene actually overlaps — about half a megabyte.
+     *
+     * Cached in R2 permanently afterwards, like buildings, because canopy from
+     * 2016-2020 imagery is not going to change.
+     * ------------------------------------------------------------------ */
+    if (url.pathname === '/api/canopy') {
+      const lat = Number(url.searchParams.get('lat'))
+      const lon = Number(url.searchParams.get('lon'))
+      const radius = Math.min(1200, Number(url.searchParams.get('r')) || 700)
+      if (!isFinite(lat) || !isFinite(lon) || Math.abs(lat) > 90 || Math.abs(lon) > 180) {
+        return jsonResponse({ error: 'bad coordinates' }, 400)
+      }
+      // The dataset stops short of the poles.
+      if (lat > 83 || lat < -56.7) {
+        return jsonResponse({ error: 'outside coverage', outside: true }, 200)
+      }
+
+      const qLat = Math.round(lat * 1000) / 1000
+      const qLon = Math.round(lon * 1000) / 1000
+      const cache = caches.default
+      const cacheKey = new Request(
+        `https://cache.internal/canopy?lat=${qLat}&lon=${qLon}&r=${radius}`,
+        { method: 'GET' },
+      )
+      const r2Key = `v1/canopy/${qLat.toFixed(3)},${qLon.toFixed(3)}/${radius}.bin`
+
+      /*
+       * The grid ships as raw bytes, not JSON.
+       *
+       * A 351×351 uint8 grid is 123 KB binary. The same numbers as a JSON
+       * array are about 400 KB before gzip and force the client to parse a
+       * six-figure array of numbers into a JS array of boxed values. Sending
+       * the bytes and reading them into a Uint8Array is smaller, faster, and
+       * exactly the shape the sampler wants. Metadata rides in headers.
+       */
+      const binHeaders = (source: string, g: { size: number; step: number; cover: number; max: number }) => ({
+        'content-type': 'application/octet-stream',
+        'cache-control': 'public, max-age=3600, s-maxage=604800',
+        'access-control-allow-origin': '*',
+        'access-control-expose-headers': 'x-grid-size, x-grid-step, x-cover, x-max, x-cache',
+        'x-grid-size': String(g.size),
+        'x-grid-step': String(g.step),
+        'x-cover': g.cover.toFixed(4),
+        'x-max': String(g.max),
+        'x-cache': source,
+      })
+
+      const hit = await cache.match(cacheKey)
+      if (hit) {
+        const r = new Response(hit.body, hit)
+        r.headers.set('x-cache', 'edge')
+        return r
+      }
+
+      if (env.BUILDINGS) {
+        const stored = await env.BUILDINGS.get(r2Key)
+        if (stored) {
+          const meta = stored.customMetadata ?? {}
+          const res = new Response(stored.body, {
+            headers: binHeaders('r2', {
+              size: Number(meta.size) || 0,
+              step: Number(meta.step) || 4,
+              cover: Number(meta.cover) || 0,
+              max: Number(meta.max) || 0,
+            }),
+          })
+          ctx.waitUntil(cache.put(cacheKey, res.clone()))
+          return res
+        }
+      }
+
+      try {
+        const grid = await sampleCanopy(qLat, qLon, radius, 4)
+        const body = grid.data
+        const res = new Response(body, { headers: binHeaders('miss', grid) })
+        ctx.waitUntil(cache.put(cacheKey, res.clone()))
+        if (env.BUILDINGS) {
+          ctx.waitUntil(
+            env.BUILDINGS.put(r2Key, body, {
+              httpMetadata: { contentType: 'application/octet-stream' },
+              customMetadata: {
+                size: String(grid.size),
+                step: String(grid.step),
+                cover: grid.cover.toFixed(4),
+                max: String(grid.max),
+              },
+            }).catch(() => {
+              /* the cache is an optimisation; never fail the request for it */
+            }),
+          )
+        }
+        return res
+      } catch (e) {
+        // A missing COG tile is ocean or a data gap, not an error worth
+        // shouting about — the client treats it as "no canopy layer here".
+        return jsonResponse(
+          { error: 'canopy unavailable', detail: String(e).slice(0, 120) },
+          503,
+        )
+      }
+    }
+
     if (url.pathname === '/api/buildings' || url.pathname === '/api/vegetation') {
       const kind = url.pathname === '/api/vegetation' ? 'vegetation' : 'buildings'
       const lat = Number(url.searchParams.get('lat'))

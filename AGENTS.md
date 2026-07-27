@@ -162,6 +162,23 @@ renders at identical brightness and the globe looks lit from every direction.
 far hemisphere, which with additive blending composites over the planet and
 floods its centre with white.
 
+**The two modes use incompatible coordinate scales, and the camera must be
+reset on BOTH transitions.** The globe has radius 1 and orbits at 1.5–7; the
+ground scene is metres, with the camera ~430 out and 95 up. The ascent guard
+originally only rescued a camera that was too *close*, so returning from the
+ground left it at 431 radii — a speck of an Earth, with zoom doing nothing
+because OrbitControls clamps to maxDistance 7. Anything outside 3–7 is now
+pulled back to 4.1, keeping only the direction.
+
+**`OrbitControls.minDistance` must sit well below `DESCEND_AT`.** It was 1.5
+against a 1.62 threshold — a 0.12 gap that damping approaches asymptotically,
+so the wheel could stall just short and the descent silently never fired. Now
+1.35.
+
+**`ModeWatcher` holds a few frames after each switch.** It polls every frame
+while the repositioning happens in an effect, so without a lockout it reads the
+old mode's coordinates and flips straight back.
+
 **Ground mode uses `LookControls`, not `OrbitControls`.** Orbit always aims at a
 fixed target, so the view can never tilt above horizontal — you physically
 cannot look up at the sky. Raising `maxPolarAngle` only buries the camera.
