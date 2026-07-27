@@ -224,6 +224,21 @@ Worker and per-view OG injection silently stops working.
 Cloudflare image resizing is **not** available on workers.dev, which is why
 `worker/png.ts` exists.
 
+## Deliberately not used
+
+**Cloudflare Sandbox / Containers.** Evaluated and rejected. Sandbox exists to
+run untrusted or agent-authored code and full dev environments, per session.
+This app's heaviest computation is ~5,300 ray tests for a whole year of sun
+hours — milliseconds of float math over typed arrays. Paying a 1-3s container
+cold start and per-second billing to run arithmetic that workerd handles
+natively would be architecture theatre. Containers also have no GPU as of
+mid-2026, so "render the OG card with real three.js" isn't on the table either.
+
+The one latent server-side feature — precomputing sun hours for popular
+locations into KV — is a plain Cron Worker job. Its only prerequisite is a pure
+PNG decoder to replace the `document.createElement('canvas')` in `terrain.ts`
+(~150 lines, mirroring the encoder already in `worker/png.ts`). No container.
+
 ## Agent-readable surfaces
 
 - `/llms.txt` — what the site is and how to query it
