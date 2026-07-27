@@ -51,6 +51,7 @@ import {
   type LocalFrame,
 } from './terrain'
 import type { Building } from './buildings'
+import { canopyTransmission, type Vegetation } from './vegetation'
 
 const DEG = Math.PI / 180
 
@@ -67,17 +68,36 @@ export interface SunHourStep {
   minute: number
   /** true when the sun is above the horizon at all */
   up: boolean
-  /** true when the sun is up AND nothing blocks the line of sight */
+  /** true when the sun is up AND nothing solid blocks the line of sight */
   sunlit: boolean
   altitude: number
   azimuth: number
   /** what interrupted the ray, when something did */
-  blockedBy: 'terrain' | 'building' | null
+  blockedBy: 'terrain' | 'building' | 'canopy' | null
+  /**
+   * Fraction of direct sun reaching the observer, 0..1.
+   *
+   * Buildings and terrain are opaque, so this is 0 or 1 for them. Canopy is
+   * not: a leafy broadleaf passes about 5% of the direct beam and the same
+   * tree bare in February passes 45%. Keeping a fraction rather than a flag is
+   * what lets the engine say "dappled" instead of forcing every moment into
+   * sun or shade.
+   */
+  fraction: number
 }
 
 export interface SunHourResult {
-  /** hours of unobstructed direct sun */
+  /** hours of completely unobstructed direct sun */
   directHours: number
+  /**
+   * Hours weighted by how much light actually arrives — full sun counts as
+   * one hour, an hour under a leafy canopy counts as about three minutes.
+   * This is the honest figure when trees are involved; with no vegetation
+   * loaded it equals `directHours` exactly.
+   */
+  effectiveHours: number
+  /** hours when the sun is up and only canopy stands in the way */
+  dappledHours: number
   /** hours the sun is above the horizon, obstructed or not */
   daylightHours: number
   /** directHours / daylightHours, 0..1 — how much of the available sun you get */
@@ -94,6 +114,8 @@ export interface SunHourResult {
   stepMinutes: number
   /** true when buildings were part of the calculation */
   hadBuildings: boolean
+  /** true when trees or woods were part of the calculation */
+  hadVegetation: boolean
 }
 
 /* ------------------------------------------------------------------ */
@@ -178,6 +200,12 @@ export interface OcclusionScene {
   radius: number
   /** observer's eye height above local ground, metres */
   eyeHeight: number
+  /**
+   * Trees and woods, when we have them. Optional because most of the world
+   * has no mapped vegetation, and an absent layer must produce exactly the
+   * old answer rather than a silently different one.
+   */
+  vegetation?: Vegetation
 }
 
 /**
@@ -265,6 +293,63 @@ export function sunVisible(
 }
 
 /**
+ * The same question, but with an answer between yes and no.
+ *
+ * `sunVisible` returns what *blocks* the sun. This returns what *fraction* of
+ * it arrives, because canopy doesn't block — it filters. Solid obstructions
+ * still short-circuit to zero; a ray that clears them then gets multiplied by
+ * whatever survives the leaves.
+ *
+ * Kept separate from `sunVisible` rather than replacing it: that function is
+ * covered by tests that assert a hard blocked/clear result, and its meaning
+ * ("what is in the way") is genuinely different from this one's ("how much
+ * gets through").
+ */
+export function sunFraction(
+  scene: OcclusionScene,
+  altitudeDeg: number,
+  azimuthDeg: number,
+  date: Date,
+  lat: number,
+): { fraction: number; blockedBy: SunHourStep['blockedBy'] } {
+  const solid = sunVisible(scene, altitudeDeg, azimuthDeg)
+  if (solid) return { fraction: 0, blockedBy: solid }
+
+  const veg = scene.vegetation
+  if (!veg || (veg.trees.length === 0 && veg.areas.length === 0)) {
+    return { fraction: 1, blockedBy: null }
+  }
+
+  // Same clamped, refraction-corrected ray the solid test uses, so the two
+  // can never disagree about where the sun is.
+  const apparent = Math.max(0, altitudeDeg + refraction(altitudeDeg))
+  const alt = apparent * DEG
+  const az = azimuthDeg * DEG
+  const ca = Math.cos(alt)
+  const dx = Math.sin(az) * ca
+  const dy = Math.sin(alt)
+  const dz = -Math.cos(az) * ca
+
+  const t = canopyTransmission(
+    veg,
+    { x: 0, y: scene.eyeHeight, z: 0 },
+    dx,
+    dy,
+    dz,
+    scene.radius,
+    date,
+    lat,
+  )
+
+  return {
+    fraction: t,
+    // Only call it canopy-blocked when the trees take a real bite. Below 0.95
+    // is the threshold at which a person would notice the difference.
+    blockedBy: t < 0.95 ? 'canopy' : null,
+  }
+}
+
+/**
  * Distance intervals where a ray from the origin along (dx, dz) lies inside a
  * polygon. Standard even-odd scanline, in ray-parameter space instead of x.
  *
@@ -332,6 +417,8 @@ export function sunHoursForDay(
   ).getTime() - offsetMs
 
   let direct = 0
+  let effective = 0
+  let dappled = 0
   let daylight = 0
   let first: number | null = null
   let last: number | null = null
@@ -342,19 +429,30 @@ export function sunHoursForDay(
     const up = altitude > HORIZON
     let blockedBy: SunHourStep['blockedBy'] = null
     let sunlit = false
+    let fraction = 0
 
     if (up) {
       daylight += stepMinutes
-      blockedBy = sunVisible(scene, altitude, azimuth)
-      sunlit = blockedBy === null
+      const r = sunFraction(scene, altitude, azimuth, t, lat)
+      fraction = r.fraction
+      blockedBy = r.blockedBy
+
+      // "Sunlit" stays strict: unobstructed sun, the thing you can sit in.
+      // Dappled light under a tree is real and worth counting, but it is not
+      // the same experience and shouldn't be added to the headline figure.
+      sunlit = fraction > 0.95
+      effective += stepMinutes * fraction
+
       if (sunlit) {
         direct += stepMinutes
         if (first === null) first = m
         last = m + stepMinutes
+      } else if (fraction > 0.02) {
+        dappled += stepMinutes
       }
     }
 
-    steps.push({ minute: m, up, sunlit, altitude, azimuth, blockedBy })
+    steps.push({ minute: m, up, sunlit, altitude, azimuth, blockedBy, fraction })
   }
 
   // Merge contiguous sunlit steps into windows — "9:40 to 13:10 and 15:20 to
@@ -369,6 +467,8 @@ export function sunHoursForDay(
 
   return {
     directHours: direct / 60,
+    effectiveHours: effective / 60,
+    dappledHours: dappled / 60,
     daylightHours: daylight / 60,
     exposure: daylight > 0 ? direct / daylight : 0,
     firstLight: first,
@@ -377,6 +477,9 @@ export function sunHoursForDay(
     windows,
     stepMinutes,
     hadBuildings: scene.prisms.length > 0,
+    hadVegetation:
+      !!scene.vegetation &&
+      (scene.vegetation.trees.length > 0 || scene.vegetation.areas.length > 0),
   }
 }
 

@@ -18,6 +18,7 @@ import {
   makeFrame,
   loadHeightField,
   sampleHeight,
+  sampleHeightLocal,
   project,
   type HeightField,
   type LocalFrame,
@@ -29,6 +30,7 @@ import {
   footprintArea,
   type Building,
 } from '../lib/buildings'
+import { fetchVegetation, type Vegetation } from '../lib/vegetation'
 
 /** How much ground to render, in metres from the pin. */
 const SCENE_RADIUS = 700
@@ -52,6 +54,8 @@ export interface GroundData {
   frame: LocalFrame
   heightField: HeightField
   buildings: Building[]
+  /** trees and woods, for both rendering and the shading trace */
+  vegetation: Vegetation
   /** ground elevation at the pin, metres */
   originHeight: number
   /** true when OSM genuinely has nothing here — countryside, ocean, data gap */
@@ -73,15 +77,23 @@ export async function loadGround(
   // both means the fast one is held hostage by the slow one. Buildings degrade
   // to an empty list rather than failing the whole scene — bare terrain is a
   // legitimate result anyway (countryside, ocean, unmapped areas).
-  const [heightField, buildings] = await Promise.all([
+  //
+  // Vegetation is a third parallel fetch and the most likely of the three to
+  // come back empty: OSM tree coverage is excellent in northern Europe and
+  // near-absent across most of the world. That's reported rather than hidden.
+  const [heightField, buildings, vegetation] = await Promise.all([
     loadHeightField(lat, lon, z, 1, signal),
     fetchBuildings(lat, lon, SCENE_RADIUS, signal).catch(() => []),
+    fetchVegetation(lat, lon, frame, SCENE_RADIUS, signal).catch(
+      (): Vegetation => ({ trees: [], areas: [], tagged: 0, failed: true }),
+    ),
   ])
 
   return {
     frame,
     heightField,
     buildings,
+    vegetation,
     originHeight: sampleHeight(heightField, lat, lon),
     empty: buildings.length === 0 && !lastFetchFailed,
     buildingsFailed: lastFetchFailed,
@@ -696,6 +708,7 @@ export function GroundScene({
 
       <Terrain data={data} sunDir={sunDir} />
       <Buildings data={data} />
+      <Trees data={data} />
       <GroundPin lit={!below} />
       <Compass altitude={altitude} azimuth={azimuth} />
 
@@ -711,6 +724,114 @@ export function GroundScene({
         ]}
       />
     </group>
+  )
+}
+
+/**
+ * Trees — instanced, because a city block can have hundreds.
+ *
+ * Two instanced meshes rather than one: broadleaves get a squashed sphere,
+ * conifers a cone, because the silhouette is the fastest way to read which
+ * kind of tree is taking your light. That distinction matters here more than
+ * it would in a normal map — a conifer shades you all winter and a bare oak
+ * mostly doesn't, and the panel says so in numbers. The shapes let you see it.
+ *
+ * Trunks are drawn but deliberately thin and unlit-looking; they contribute
+ * almost nothing to shading and exist so the crowns don't float.
+ */
+function Trees({ data }: { data: GroundData }) {
+  const { broadleaf, conifer, trunks } = useMemo(() => {
+    const { vegetation, heightField, frame, originHeight } = data
+    const b: { pos: THREE.Vector3; scale: THREE.Vector3 }[] = []
+    const c: { pos: THREE.Vector3; scale: THREE.Vector3 }[] = []
+    const t: { pos: THREE.Vector3; scale: THREE.Vector3 }[] = []
+
+    for (const tree of vegetation.trees) {
+      const ground = sampleHeightLocal(heightField, frame, tree.x, tree.z) - originHeight
+      if (!isFinite(ground)) continue
+
+      const isConifer = tree.leaf === 'needleleaved'
+      const span = isConifer ? 0.7 : 0.5
+      const crownH = tree.height * span
+
+      const entry = {
+        pos: new THREE.Vector3(tree.x, ground + tree.crownCentre, tree.z),
+        // Unit sphere / unit cone scaled to the crown's real dimensions.
+        scale: new THREE.Vector3(tree.crown, crownH / 2, tree.crown),
+      }
+      ;(isConifer ? c : b).push(entry)
+
+      t.push({
+        pos: new THREE.Vector3(tree.x, ground + (tree.height * (1 - span)) / 2, tree.z),
+        scale: new THREE.Vector3(1, (tree.height * (1 - span)) / 2, 1),
+      })
+    }
+    return { broadleaf: b, conifer: c, trunks: t }
+  }, [data])
+
+  if (broadleaf.length === 0 && conifer.length === 0) return null
+
+  return (
+    <group>
+      <TreeInstances items={broadleaf} kind="broadleaf" />
+      <TreeInstances items={conifer} kind="conifer" />
+      <TreeInstances items={trunks} kind="trunk" />
+    </group>
+  )
+}
+
+function TreeInstances({
+  items,
+  kind,
+}: {
+  items: { pos: THREE.Vector3; scale: THREE.Vector3 }[]
+  kind: 'broadleaf' | 'conifer' | 'trunk'
+}) {
+  const ref = useRef<THREE.InstancedMesh>(null)
+
+  useEffect(() => {
+    if (!ref.current) return
+    const m = new THREE.Matrix4()
+    const q = new THREE.Quaternion()
+    for (let i = 0; i < items.length; i++) {
+      m.compose(items[i].pos, q, items[i].scale)
+      ref.current.setMatrixAt(i, m)
+    }
+    ref.current.instanceMatrix.needsUpdate = true
+    ref.current.computeBoundingSphere()
+  }, [items])
+
+  if (items.length === 0) return null
+
+  return (
+    <instancedMesh
+      ref={ref}
+      args={[undefined as never, undefined as never, items.length]}
+      castShadow={kind !== 'trunk'}
+      receiveShadow
+      frustumCulled={false}
+    >
+      {kind === 'conifer' ? (
+        <coneGeometry args={[1, 2, 8]} />
+      ) : kind === 'trunk' ? (
+        <cylinderGeometry args={[0.22, 0.32, 2, 6]} />
+      ) : (
+        // Low-poly on purpose: a few hundred crowns at full tessellation is a
+        // lot of triangles for a shape nobody inspects closely.
+        <sphereGeometry args={[1, 10, 7]} />
+      )}
+      <meshStandardMaterial
+        color={kind === 'trunk' ? '#4a3b2e' : kind === 'conifer' ? '#2f4a33' : '#3f5c38'}
+        roughness={0.95}
+        metalness={0}
+        // Crowns are not solid. A little transparency reads as foliage and
+        // matches what the shading maths says is happening — light does get
+        // through.
+        transparent={kind !== 'trunk'}
+        opacity={kind === 'trunk' ? 1 : 0.92}
+        flatShading={kind !== 'trunk'}
+      />
+    </instancedMesh>
   )
 }
 

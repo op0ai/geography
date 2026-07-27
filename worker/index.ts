@@ -21,7 +21,17 @@ interface Env {
   BUILDINGS?: R2Bucket
 }
 
-const SITE = 'https://geography-globe.op0.workers.dev'
+/**
+ * The canonical origin. Everything else redirects here.
+ *
+ * Shared links, OG cards and canonical tags all have to agree on one hostname
+ * or crawlers will index the same view twice and social platforms will cache
+ * whichever they saw first.
+ */
+const SITE = 'https://opensolar.app'
+
+/** The old workers.dev hostname, kept alive purely to redirect. */
+const LEGACY_HOST = 'geography-globe.op0.workers.dev'
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                             */
@@ -68,7 +78,39 @@ function parseView(url: URL) {
   const country = (url.searchParams.get('in') || (atDefault ? DEFAULT_VIEW.country : '')).slice(0, 60)
   const planet = (url.searchParams.get('on') || 'earth').slice(0, 20)
   const ground = url.searchParams.has('ground')
-  return { lat, lon, t, name, country, planet, ground }
+
+  /*
+   * The shading result, carried in the link.
+   *
+   * `sun` is hours of unobstructed direct sun at this exact point, and `dap`
+   * is hours of dappled light through canopy. Both computed in the browser —
+   * the trace needs terrain tiles and building geometry the Worker doesn't
+   * have — so the client encodes its answer into the URL when it shares one.
+   *
+   * That makes the OG card say "5h 20m of direct sun here" instead of a
+   * generic sun-position readout, which is the difference between a link that
+   * explains itself in a chat window and one that doesn't.
+   *
+   * Range-checked rather than trusted: these arrive from a querystring anyone
+   * can edit, and a card claiming 900 hours of sunlight would be worse than
+   * no card at all.
+   */
+  const rawSun = parseFloat(url.searchParams.get('sun') ?? '')
+  const sunHours = isFinite(rawSun) && rawSun >= 0 && rawSun <= 24 ? rawSun : null
+  const rawDap = parseFloat(url.searchParams.get('dap') ?? '')
+  const dappled = isFinite(rawDap) && rawDap >= 0 && rawDap <= 24 ? rawDap : null
+
+  return { lat, lon, t, name, country, planet, ground, sunHours, dappled }
+}
+
+/** "5.33" → "5h 20m". Matches the in-app formatting exactly. */
+function fmtHours(h: number): string {
+  if (h <= 0) return 'no direct sun'
+  const hh = Math.floor(h)
+  const mm = Math.round((h - hh) * 60)
+  if (hh === 0) return `${mm}m`
+  if (mm === 0) return `${hh}h`
+  return `${hh}h ${mm}m`
 }
 
 const fmt = (d: Date | null) =>
@@ -181,7 +223,12 @@ function metaFor(v: ReturnType<typeof parseView>, url: URL) {
       ? ` on ${v.planet[0].toUpperCase()}${v.planet.slice(1)}`
       : ''
 
-  const title = `${place}${onPlanet} — ${phase.label} · geography`
+  // With a shading result the title says the thing worth saying. "Tromsø —
+  // 5h 20m of direct sun" is a headline; "Tromsø — Daylight" is a label.
+  const title =
+    v.sunHours !== null
+      ? `${place} — ${fmtHours(v.sunHours)} of direct sun · geography`
+      : `${place}${onPlanet} — ${phase.label} · geography`
 
   const dayLen = times.alwaysUp
     ? 'the sun never sets today'
@@ -190,9 +237,16 @@ function metaFor(v: ReturnType<typeof parseView>, url: URL) {
       : `${times.dayLengthHours.toFixed(1)} hours of daylight`
 
   const description =
-    `The sun is ${sun.altitude.toFixed(1)}° above the horizon at bearing ` +
-    `${sun.azimuth.toFixed(0)}° — ${dayLen}. ` +
-    `Sunrise ${fmt(times.sunrise)}, sunset ${fmt(times.sunset)} UTC.`
+    v.sunHours !== null
+      ? `Ray-traced against the terrain and buildings around this exact point: ` +
+        `${fmtHours(v.sunHours)} of direct sun` +
+        (v.dappled !== null && v.dappled > 0.08
+          ? `, plus ${fmtHours(v.dappled)} of dappled light through the trees`
+          : '') +
+        `, out of ${dayLen}.`
+      : `The sun is ${sun.altitude.toFixed(1)}° above the horizon at bearing ` +
+        `${sun.azimuth.toFixed(0)}° — ${dayLen}. ` +
+        `Sunrise ${fmt(times.sunrise)}, sunset ${fmt(times.sunset)} UTC.`
 
   // The OG image mirrors the view's own parameters so the card matches the page.
   const og = new URL('/og.png', SITE)
@@ -200,6 +254,8 @@ function metaFor(v: ReturnType<typeof parseView>, url: URL) {
   og.searchParams.set('t', v.t.toISOString())
   if (v.name) og.searchParams.set('name', v.name)
   if (v.country) og.searchParams.set('in', v.country)
+  if (v.sunHours !== null) og.searchParams.set('sun', v.sunHours.toFixed(2))
+  if (v.dappled !== null) og.searchParams.set('dap', v.dappled.toFixed(2))
 
   const canonical = `${SITE}${url.pathname}${url.search}`
 
@@ -232,6 +288,7 @@ async function fetchBuildingArea(
   lat: number,
   lon: number,
   radius: number,
+  kind: 'buildings' | 'vegetation' = 'buildings',
 ): Promise<{ ok: boolean; body: string; rateLimited: boolean }> {
   const dLat = radius / 111320
   const dLon = radius / (111320 * Math.cos((lat * Math.PI) / 180))
@@ -242,6 +299,29 @@ async function fetchBuildingArea(
     (lon + dLon).toFixed(6),
   ].join(',')
 
+  /*
+   * Two query shapes.
+   *
+   * Buildings: ways plus relations, because multipolygon buildings (the ones
+   * with courtyards) only come back whole with relations included.
+   *
+   * Vegetation: individual tree nodes, tree rows, and wood/forest polygons.
+   * Trees are nodes rather than ways, so `out geom` isn't needed for them —
+   * but it is for the rows and stands, and mixing both in one query is
+   * cheaper than two round trips against a rate-limited service.
+   */
+  const vegetation =
+    `[out:json][timeout:20];(` +
+    `node["natural"="tree"](${bbox});` +
+    `way["natural"="tree_row"](${bbox});` +
+    `way["natural"="wood"](${bbox});` +
+    `way["landuse"="forest"](${bbox});` +
+    `);out geom;`
+  // Dropping the stands keeps individual trees, which matter far more at
+  // garden scale, when the full query is too slow.
+  const vegetationLite =
+    `[out:json][timeout:20];(node["natural"="tree"](${bbox});way["natural"="tree_row"](${bbox}););out geom;`
+
   const withRelations =
     `[out:json][timeout:20];(way["building"](${bbox});relation["building"](${bbox}););out geom;`
   const waysOnly = `[out:json][timeout:20];(way["building"](${bbox}););out geom;`
@@ -251,7 +331,10 @@ async function fetchBuildingArea(
     'https://overpass.private.coffee/api/interpreter',
     'https://overpass.kumi.systems/api/interpreter',
   ]
-  const PASSES = [withRelations, waysOnly, waysOnly]
+  const PASSES =
+    kind === 'vegetation'
+      ? [vegetation, vegetationLite, vegetationLite]
+      : [withRelations, waysOnly, waysOnly]
 
   let rateLimited = false
 
@@ -267,7 +350,7 @@ async function fetchBuildingArea(
             // and then fails to read — returning a 504 that looks like a
             // timeout rather than the malformed request it is.
             'Content-Type': 'application/x-www-form-urlencoded',
-            'User-Agent': 'geography-globe (+https://geography-globe.op0.workers.dev)',
+            'User-Agent': 'opensolar.app (+https://opensolar.app)',
           },
           // Measured: central Berlin takes ~9s cold with no contention, so a
           // 12s ceiling was cutting off requests that were about to succeed.
@@ -311,6 +394,24 @@ function jsonResponse(body: unknown, status = 200): Response {
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url)
+
+    /*
+     * Canonical host.
+     *
+     * The app answers on opensolar.app now. The workers.dev subdomain stays
+     * enabled deliberately rather than being switched off in config — turning
+     * it off makes every previously shared link, every OG card already cached
+     * by Slack and Twitter, and every crawler-indexed URL simply fail. A 301
+     * keeps them all working and consolidates the ranking signal.
+     *
+     * This runs FIRST, before any cache lookup. A redirect must never be
+     * written into the cache under a content URL's key, and returning early is
+     * the simplest way to guarantee that.
+     */
+    if (url.hostname === LEGACY_HOST) {
+      const to = new URL(url.pathname + url.search, SITE)
+      return Response.redirect(to.toString(), 301)
+    }
 
     /* ---- dynamic OG image ----
        Drawn with a hand-rolled rasterizer (worker/png.ts) rather than Satori
@@ -374,20 +475,54 @@ export default {
         text(r, label.toUpperCase(), x, 448, 14, FAINT, false, 1, 0.09)
         text(r, value, x, 504, 44, col, true)
       }
-      stat(80, 'Sun altitude', `${sun.altitude.toFixed(1)}°`, tint)
-      stat(340, 'Bearing', `${sun.azimuth.toFixed(0)}°`, INK)
-      stat(560, 'Daylight',
-        times.alwaysUp ? '24h' : times.alwaysDown ? '0h' : `${times.dayLengthHours.toFixed(1)}h`,
-        INK)
+      const dayLenStr = times.alwaysUp
+        ? '24h'
+        : times.alwaysDown
+          ? '0h'
+          : `${times.dayLengthHours.toFixed(1)}h`
 
-      text(
-        r,
-        `Sunrise ${fmt(times.sunrise)}  ·  Sunset ${fmt(times.sunset)} UTC`,
-        80,
-        560,
-        18,
-        MUTE,
-      )
+      if (v.sunHours !== null) {
+        /*
+         * When the link carries a shading result, the card leads with it.
+         *
+         * Sun altitude and bearing are true of everyone within a few
+         * kilometres; "5h 20m of direct sun at this exact spot" is true of
+         * nowhere else, and it's the thing worth putting in a share card. The
+         * generic astronomy moves to the supporting line.
+         */
+        const SUN: [number, number, number] = [255, 209, 102]
+        text(r, 'DIRECT SUN HERE', 80, 448, 14, FAINT, false, 1, 0.09)
+        text(r, fmtHours(v.sunHours), 80, 512, 56, SUN, true)
+
+        const w = measure(fmtHours(v.sunHours), 56, true)
+        if (v.dappled !== null && v.dappled > 0.08) {
+          const LEAF: [number, number, number] = [110, 214, 160]
+          text(r, `+ ${fmtHours(v.dappled)} dappled`, 92 + w, 508, 22, LEAF)
+        }
+
+        text(
+          r,
+          `${dayLenStr} of daylight  ·  sun ${sun.altitude.toFixed(0)}° at ${sun.azimuth.toFixed(0)}°  ·  ` +
+            `sunrise ${fmt(times.sunrise)}, sunset ${fmt(times.sunset)} UTC`,
+          80,
+          560,
+          17,
+          MUTE,
+        )
+      } else {
+        stat(80, 'Sun altitude', `${sun.altitude.toFixed(1)}°`, tint)
+        stat(340, 'Bearing', `${sun.azimuth.toFixed(0)}°`, INK)
+        stat(560, 'Daylight', dayLenStr, INK)
+
+        text(
+          r,
+          `Sunrise ${fmt(times.sunrise)}  ·  Sunset ${fmt(times.sunset)} UTC`,
+          80,
+          560,
+          18,
+          MUTE,
+        )
+      }
       text(r, `${v.t.toISOString().slice(0, 16).replace('T', ' ')} UTC`, 80, 592, 15, FAINT)
 
       // Sky dome, with the sun at its true altitude and bearing.
@@ -446,7 +581,8 @@ export default {
      * cache key is rounded to ~100m, which is well inside the 700m scene
      * radius, so neighbours share an entry.
      * ------------------------------------------------------------------ */
-    if (url.pathname === '/api/buildings') {
+    if (url.pathname === '/api/buildings' || url.pathname === '/api/vegetation') {
+      const kind = url.pathname === '/api/vegetation' ? 'vegetation' : 'buildings'
       const lat = Number(url.searchParams.get('lat'))
       const lon = Number(url.searchParams.get('lon'))
       const radius = Math.min(2000, Number(url.searchParams.get('r')) || 700)
@@ -459,17 +595,32 @@ export default {
       // the traffic from everyone looking at the same landmark.
       const qLat = Math.round(lat * 1000) / 1000
       const qLon = Math.round(lon * 1000) / 1000
-
       const cache = caches.default
-      const cacheUrl = new URL(url)
-      cacheUrl.search = `?lat=${qLat}&lon=${qLon}&r=${radius}`
-      const cacheKey = new Request(cacheUrl.toString(), { method: 'GET' })
-      const r2Key = `v1/${qLat.toFixed(3)},${qLon.toFixed(3)}/${radius}.json`
+
+      /*
+       * Cache keys are built on a FIXED synthetic host, not the request's own.
+       *
+       * The Cache API keys on the full request URL, hostname included. This
+       * Worker now answers on both opensolar.app and the workers.dev
+       * subdomain, so keying on the real host would split every entry in two —
+       * halving the hit rate and orphaning the whole cache the day the old
+       * hostname goes away. A constant internal host collapses them.
+       */
+      const keyFor = (r: number) =>
+        new Request(`https://cache.internal/${kind}?lat=${qLat}&lon=${qLon}&r=${r}`, {
+          method: 'GET',
+        })
+
+      const r2Key = `v1/${kind}/${qLat.toFixed(3)},${qLon.toFixed(3)}/${radius}.json`
+      const cacheKey = keyFor(radius)
 
       const headers = (source: string) => ({
         'content-type': 'application/json; charset=utf-8',
-        'cache-control':
-          'public, max-age=3600, s-maxage=86400, stale-while-revalidate=604800, stale-if-error=604800',
+        // s-maxage drives the edge TTL; max-age the browser. Note that
+        // stale-while-revalidate and stale-if-error are documented as NOT
+        // honoured by the Cache API — they're left off rather than kept as
+        // decoration that implies behaviour we don't get.
+        'cache-control': 'public, max-age=3600, s-maxage=86400',
         'access-control-allow-origin': '*',
         'x-cache': source,
       })
@@ -482,15 +633,13 @@ export default {
        * second. Every Worker request shares one IP. Measured under load, only
        * 2 of 8 concurrent cold cities came back at all.
        *
-       * But buildings don't move. So the question isn't "can Overpass answer
-       * this request" — it's "has Overpass ever answered for this area". R2
-       * makes that distinction real:
+       * But buildings and trees don't move. So the question isn't "can
+       * Overpass answer this request" — it's "has Overpass ever answered for
+       * this area". R2 makes that distinction real:
        *
        *   1. Edge cache — same colo, same area, ~200ms.
        *   2. R2 — anywhere in the world has already asked. Permanent.
        *   3. Overpass — the first person ever to look at this spot.
-       *
-       * A launch-day traffic spike hits tier 3 exactly once per area.
        */
       const hit = await cache.match(cacheKey)
       if (hit) {
@@ -508,7 +657,7 @@ export default {
         }
       }
 
-      const result = await fetchBuildingArea(qLat, qLon, radius)
+      const result = await fetchBuildingArea(qLat, qLon, radius, kind)
 
       if (result.ok) {
         const res = new Response(result.body, { headers: headers('miss') })
@@ -517,8 +666,8 @@ export default {
           ctx.waitUntil(
             env.BUILDINGS.put(r2Key, result.body, {
               httpMetadata: { contentType: 'application/json' },
-            }).catch((e) => {
-              console.error('R2 put failed', r2Key, String(e))
+            }).catch(() => {
+              /* the cache is an optimisation; never fail the request for it */
             }),
           )
         }
@@ -526,12 +675,14 @@ export default {
       }
 
       /*
-       * Overpass didn't answer. Before giving up, check whether R2 has a
-       * WIDER radius for this spot — a 700m result contains everything a 300m
-       * one would, so it's a strictly better answer, not a fallback.
+       * Overpass didn't answer. Before giving up, check whether R2 has a WIDER
+       * radius for this spot — a 700m result contains everything a 300m one
+       * would, so it's a strictly better answer, not a fallback.
        */
       if (env.BUILDINGS && radius < 700) {
-        const wider = await env.BUILDINGS.get(`v1/${qLat.toFixed(3)},${qLon.toFixed(3)}/700.json`)
+        const wider = await env.BUILDINGS.get(
+          `v1/${kind}/${qLat.toFixed(3)},${qLon.toFixed(3)}/700.json`,
+        )
         if (wider) {
           return new Response(wider.body, { headers: headers('r2-wider') })
         }
@@ -711,7 +862,7 @@ as a markdown table, with no JavaScript required.
 - [Source](https://github.com/op0ai/geography)
 `
 
-const ROBOTS = `# geography — https://geography-globe.op0.workers.dev
+const ROBOTS = `# geography — https://opensolar.app
 # Content is freely readable by AI crawlers and agents.
 
 User-agent: *

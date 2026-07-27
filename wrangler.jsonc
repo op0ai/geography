@@ -25,5 +25,14 @@
     { "binding": "BUILDINGS", "bucket_name": "geography-buildings" }
   ],
 
+  // The canonical hostname. workers.dev stays ENABLED on purpose — the Worker
+  // 301s it to opensolar.app, which keeps every previously shared link, cached
+  // OG card and indexed URL working. Disabling it would break them outright.
+  //
+  // Note: adding `routes` without an explicit `workers_dev` flips it to false
+  // on the next deploy, so it has to be stated.
+  "routes": [{ "pattern": "opensolar.app", "custom_domain": true }],
+  "workers_dev": true,
+
   "observability": { "enabled": true }
 }

@@ -113,7 +113,17 @@ export default function App() {
   // Where the viewer is looking in ground mode. Free-look without a heading
   // readout is disorienting — you lose track of which way is north and whether
   // the bright patch you're looking at is actually the sun.
-  const [look, setLook] = useState({ yaw: 0, pitch: 0 })
+  const [look, setLook] = useState({ yaw: 0, pitch: 0, x: 0, z: 0, moving: false })
+  /**
+   * Where you've walked to, as a real coordinate.
+   *
+   * Kept separate from `coord` deliberately. `coord` is where you *landed* —
+   * it's what the terrain tiles and building query were fetched for, and
+   * changing it tears down and reloads the whole scene. Walking must not do
+   * that. So the sun readings follow `readCoord` (here if you've walked,
+   * otherwise the pin) while the scene stays anchored to `coord`.
+   */
+  const [walkCoord, setWalkCoord] = useState<{ lat: number; lon: number } | null>(null)
   // Mirror of groundState.status for the descent timer to poll — reading state
   // directly inside an interval would capture a stale closure.
   const readyRef = useRef<GroundState['status']>('idle')
@@ -132,6 +142,10 @@ export default function App() {
   const [yearComputing, setYearComputing] = useState(false)
 
   const isEarth = planet.id === 'earth'
+
+  // What the numbers describe: where you're standing, which is the pin until
+  // you walk away from it.
+  const readCoord = walkCoord ?? coord
 
   /* ---------------- time playback ---------------- */
   const raf = useRef<number>(0)
@@ -182,12 +196,12 @@ export default function App() {
 
   /* ---------------- the numbers ---------------- */
   const sun = useMemo(
-    () => solarPosition(date, coord.lat, coord.lon),
-    [date, coord],
+    () => solarPosition(date, readCoord.lat, readCoord.lon),
+    [date, readCoord],
   )
   const times = useMemo(
-    () => sunTimes(date, coord.lat, coord.lon),
-    [date, coord],
+    () => sunTimes(date, readCoord.lat, readCoord.lon),
+    [date, readCoord],
   )
   const subsolar = useMemo(() => subsolarPoint(date), [date])
   const phase = useMemo(() => phaseFor(sun.altitude), [sun.altitude])
@@ -232,6 +246,12 @@ export default function App() {
     readyRef.current = groundState.status
   }, [groundState.status])
 
+  // A new pin, or leaving the ground, means you're no longer standing anywhere
+  // in particular.
+  useEffect(() => {
+    setWalkCoord(null)
+  }, [coord.lat, coord.lon, viewMode])
+
   /* ---------------- how much sun does this spot get ----------------
    *
    * The headline feature. Everything else reports where the sun is; this
@@ -250,7 +270,14 @@ export default function App() {
       frame: g.frame,
       hf: g.heightField,
       prisms: buildPrisms(g.buildings, g.frame, g.heightField, g.originHeight),
+      // The datum stays the landing point's elevation — the prisms and the
+      // height field are both expressed relative to it. Walking changes where
+      // the ray STARTS (handled by `observer` below), not what "zero" means.
       originHeight: g.originHeight,
+      // Trees, when OSM has them here. Canopy attenuates rather than blocks,
+      // so this changes the answer from "5h" to "5h, plus 2h of dappled light
+      // under the sycamore" — and makes February different from July.
+      vegetation: g.vegetation,
       radius: 700,
       // Standing height. The difference between this and ground level matters
       // in dense streets, where a metre of elevation can clear a parapet.
@@ -268,7 +295,7 @@ export default function App() {
     let cancelled = false
     setComputing(true)
     const id = setTimeout(() => {
-      const r = sunHoursForDay(occlusion, coord.lat, coord.lon, date, 10)
+      const r = sunHoursForDay(occlusion, readCoord.lat, readCoord.lon, date, 10)
       if (!cancelled) {
         setSunHours(r)
         setComputing(false)
@@ -280,7 +307,7 @@ export default function App() {
       setComputing(false)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [occlusion, coord.lat, coord.lon, dayKey, isEarth])
+  }, [occlusion, readCoord.lat, readCoord.lon, dayKey, isEarth])
 
   // The year is thousands of rays, so it's opt-in and yields between chunks
   // rather than blocking the frame.
@@ -291,8 +318,8 @@ export default function App() {
     setTimeout(() => {
       const y = sunHoursForYear(
         occlusion,
-        coord.lat,
-        coord.lon,
+        readCoord.lat,
+        readCoord.lon,
         date.getUTCFullYear(),
         5,
         20,
@@ -300,12 +327,12 @@ export default function App() {
       setSunHoursYear(y)
       setYearComputing(false)
     }, 30)
-  }, [occlusion, coord.lat, coord.lon, date])
+  }, [occlusion, readCoord.lat, readCoord.lon, date])
 
   // A new location invalidates the year — it's specific to this skyline.
   useEffect(() => {
     setSunHoursYear(null)
-  }, [coord.lat, coord.lon])
+  }, [readCoord.lat, readCoord.lon])
 
   const sky = useMemo(
     () => (weather ? sliceAt(weather, date) : null),
@@ -441,19 +468,33 @@ export default function App() {
     }
   }, [query])
 
-  // Mirror state into the address bar (replaceState, so scrubbing time doesn't
-  // fill the back button with hundreds of entries).
+  // Mirror state into the address bar. Throttled while the clock is running —
+  // see urlstate.ts for the rate limits, which are far lower than they look.
+  // Discrete changes (a new place, a different planet, pausing) write at once
+  // so the settled URL is exact the moment motion stops.
   useEffect(() => {
-    syncUrl({
-      lat: coord.lat,
-      lon: coord.lon,
-      t: date.toISOString(),
-      planet: planet.id,
-      mode: viewMode,
-      name: place?.name,
-      country: place?.country,
-    })
-  }, [coord.lat, coord.lon, date, planet.id, viewMode, place?.name, place?.country])
+    syncUrl(
+      {
+        lat: coord.lat,
+        lon: coord.lon,
+        t: date.toISOString(),
+        planet: planet.id,
+        mode: viewMode,
+        name: place?.name,
+        country: place?.country,
+      },
+      !playing,
+    )
+  }, [
+    coord.lat,
+    coord.lon,
+    date,
+    planet.id,
+    viewMode,
+    place?.name,
+    place?.country,
+    playing,
+  ])
 
   const results = useMemo(() => {
     const local: GeoResult[] = localResults.map((p) => ({
@@ -487,14 +528,24 @@ export default function App() {
   }, [date, coord.lon])
 
   const copyShareLink = useCallback(async () => {
+    // The shared link carries the shading answer when we have one, so the
+    // card in a chat window reads "5h 20m of direct sun here" rather than a
+    // generic readout. Built fresh from live state, so it's exact even while
+    // the address-bar mirror is throttled.
     const url = shareUrl({
-      lat: coord.lat,
-      lon: coord.lon,
+      lat: readCoord.lat,
+      lon: readCoord.lon,
       t: date.toISOString(),
       planet: planet.id,
       mode: viewMode,
       name: place?.name,
       country: place?.country,
+      // Only when the trace actually ran against real building data —
+      // sharing a terrain-only figure would spread a number the panel itself
+      // refuses to display.
+      ...(sunHours && groundState.status === 'ready' && !groundState.buildingsFailed
+        ? { sunHours: sunHours.directHours, dappled: sunHours.dappledHours }
+        : {}),
     })
     try {
       await navigator.clipboard.writeText(url)
@@ -615,6 +666,7 @@ export default function App() {
           }}
           onGroundState={setGroundState}
           onLook={setLook}
+          onGroundWalk={(lat, lon) => setWalkCoord({ lat, lon })}
           onHover={setHover}
           onContextStatus={setContextStatus}
         />
@@ -1224,6 +1276,7 @@ export default function App() {
               buildingsEstimated={groundState.estimated}
               hadBuildings={groundState.buildings > 0}
               buildingsFailed={groundState.buildingsFailed}
+              trees={groundState.trees}
               onClose={() => setShadingOpen(false)}
             />
           </div>
@@ -1243,6 +1296,14 @@ export default function App() {
             className="absolute left-1/2 -translate-x-1/2 top-[86px] pointer-events-none z-10"
           >
             <div className="panel r-outer px-4 py-2 flex items-center gap-4 text-[11px]">
+              {walkCoord && (
+                <>
+                  <span className="tabular text-emerald-300/80" title="You've walked from the pin">
+                    {Math.round(Math.hypot(look.x, look.z))} m
+                  </span>
+                  <span className="w-px h-3.5 bg-white/12" />
+                </>
+              )}
               <span className="tabular w-medium">
                 {compass(look.yaw)}
                 <span className="text-[var(--color-ink-faint)] ml-1.5">
@@ -1540,7 +1601,7 @@ export default function App() {
 
         <p className="text-center text-[10px] text-[var(--color-ink-faint)] mt-2.5">
           {viewMode === 'ground'
-            ? 'Real terrain and OpenStreetMap buildings · drag to look · zoom out to leave'
+            ? 'Drag to look · WASD or arrows to walk · double-tap to go there · zoom out to leave'
             : 'Click the globe to move the pin · zoom in to land · space to play · t for now'}
         </p>
       </div>

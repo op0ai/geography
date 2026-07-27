@@ -3,7 +3,10 @@
 Pin any point on Earth at any moment and see exactly what the sun is doing —
 then move that place to Mars, or Uranus, and watch the light change.
 
-**Live: https://geography-globe.op0.workers.dev**
+**Live: https://opensolar.app**
+
+Every view is a link, and a shared link carries its own answer — paste one into
+Slack and the card reads *"5h 20m of direct sun here"*, not a generic readout.
 
 ## What it does
 
@@ -19,6 +22,14 @@ then move that place to Mars, or Uranus, and watch the light change.
   Checked against real geometry at the winter solstice: Midtown Manhattan gets
   **0%** of available daylight at street level, Trafalgar Square 74%, the
   Champ de Mars 90%, open farmland 100%.
+
+- **Trees, modelled as filters rather than walls.** A leafy broadleaf passes
+  about 5% of direct sun; the same tree bare in February passes 45%; a conifer
+  blocks year-round. So the answer for a garden under an oak genuinely changes
+  with the season, and dappled light is counted separately from full sun
+  instead of being rounded into shade. 1,647 mapped trees around a point in
+  central Amsterdam; none at all in most of the world, and the app says which
+  you're getting.
 
   When the building data doesn't load, the number is **withheld** rather than
   shown. A terrain-only figure in a city is barely different from raw daylight,
@@ -98,11 +109,14 @@ in distance, one overlap test against the prism's vertical extent is exact.
 
 Stated in the UI, not buried in a footnote:
 
-- **No trees.** OpenStreetMap has building footprints, not vegetation. A tree
-  next door will shade you and this won't know.
-- **Estimated heights.** Where OSM has no tagged height, it's inferred from
-  storey count at 3 m each. The UI reports how many of your neighbours were
-  guessed.
+- **Estimated heights.** Only ~3% of OpenStreetMap trees carry a height and ~2%
+  a crown width, so tree geometry is nearly always defaulted from open-grown
+  urban allometry. Building heights come from storey counts where a real height
+  is missing. The panel reports how much of what's around you was guessed.
+- **Patchy tree coverage.** Germany has 4.07M mapped trees for 84 million
+  people; India has 111k for 1.4 billion. Where OSM has nothing, vegetation
+  isn't modelled and the app says so rather than quietly returning a confident
+  number.
 - **700 metre radius.** A distant ridge or tower can be missed at very low sun.
 - **Clear-sky geometry**, not a forecast.
 
@@ -115,7 +129,7 @@ Tailwind v4 · Vite · deployed to Cloudflare Workers.
 
 See [AGENTS.md](./AGENTS.md) — setup, the verification suites, and the design
 decisions that were bugs first. Also served live at
-[/AGENTS.md](https://geography-globe.op0.workers.dev/AGENTS.md).
+[/AGENTS.md](https://opensolar.app/AGENTS.md).
 
 ## Development
 

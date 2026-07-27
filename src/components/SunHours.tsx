@@ -41,6 +41,7 @@ export function SunHoursPanel({
   buildingsEstimated,
   hadBuildings,
   buildingsFailed,
+  trees,
   onClose,
 }: {
   result: SunHourResult | null
@@ -53,6 +54,8 @@ export function SunHoursPanel({
   hadBuildings: boolean
   /** true when the OSM lookup errored — NOT the same as "no buildings here" */
   buildingsFailed: boolean
+  /** mapped trees nearby — drives the coverage note */
+  trees: number
   onClose: () => void
 }) {
   return (
@@ -111,6 +114,7 @@ export function SunHoursPanel({
             <Caveats
               buildingsEstimated={buildingsEstimated}
               hadBuildings={hadBuildings}
+              trees={trees}
             />
           </>
         ) : (
@@ -194,6 +198,20 @@ function Headline({
           <>, and nothing here blocks any of it.</>
         )}
       </p>
+
+      {/* Dappled light is real and worth naming. An hour under a leafy tree is
+          not an hour of sun, but it isn't shade either, and lumping it into
+          one bucket or the other would misrepresent a garden. */}
+      {result.dappledHours > 0.08 && (
+        <p className="mt-2 rounded-lg bg-emerald-400/[0.07] px-2.5 py-2 text-[11px] leading-relaxed text-emerald-100/75">
+          Plus{' '}
+          <span className="font-medium text-emerald-100">
+            {formatHours(result.dappledHours)}
+          </span>{' '}
+          of dappled light through the trees — counted at{' '}
+          {formatHours(result.effectiveHours)} of full-sun equivalent overall.
+        </p>
+      )}
     </div>
   )
 }
@@ -226,9 +244,16 @@ function DayBar({ result }: { result: SunHourResult }) {
               s.sunlit
                 ? 'bg-amber-300'
                 : s.up
-                  ? s.blockedBy === 'building'
-                    ? 'bg-slate-500/70'
-                    : 'bg-slate-600/50'
+                  ? s.blockedBy === 'canopy'
+                    ? // Dappled: green, and lighter the more light gets through,
+                      // so a bare February tree reads differently from a leafy
+                      // July one at a glance.
+                      s.fraction > 0.25
+                      ? 'bg-emerald-400/60'
+                      : 'bg-emerald-500/40'
+                    : s.blockedBy === 'building'
+                      ? 'bg-slate-500/70'
+                      : 'bg-slate-600/50'
                   : 'bg-white/[0.06]'
             }
           />
@@ -245,6 +270,9 @@ function DayBar({ result }: { result: SunHourResult }) {
 
       <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-white/45">
         <Key className="bg-amber-300" label="direct sun" />
+        {result.hadVegetation && (
+          <Key className="bg-emerald-400/60" label="dappled, through trees" />
+        )}
         <Key className="bg-slate-500/70" label="blocked by a building" />
         <Key className="bg-slate-600/50" label="blocked by terrain" />
         <Key className="bg-white/[0.06]" label="below the horizon" />
@@ -380,9 +408,11 @@ function YearStrip({
 function Caveats({
   buildingsEstimated,
   hadBuildings,
+  trees,
 }: {
   buildingsEstimated: number
   hadBuildings: boolean
+  trees: number
 }) {
   const [open, setOpen] = useState(false)
 
@@ -417,9 +447,27 @@ function Caveats({
             className="overflow-hidden text-[11px] leading-relaxed text-white/45"
           >
             <li className="mt-2">
-              <strong className="font-medium text-white/65">No trees.</strong>{' '}
-              OpenStreetMap has building footprints, not vegetation. A tree next
-              door will shade you and this won't know.
+              <strong className="font-medium text-white/65">
+                {trees > 0
+                  ? `${trees} mapped ${trees === 1 ? 'tree' : 'trees'} nearby.`
+                  : 'No mapped trees here.'}
+              </strong>{' '}
+              {trees > 0 ? (
+                <>
+                  Canopy is modelled as filtering light rather than blocking it —
+                  about 5% of direct sun passes a leafy broadleaf and 45% passes
+                  the same tree bare in winter, so the seasonal answer differs.
+                  Heights are almost always estimated: only ~3% of trees in
+                  OpenStreetMap carry one.
+                </>
+              ) : (
+                <>
+                  OpenStreetMap tree coverage is excellent in northern Europe and
+                  thin across most of the world, so vegetation isn't part of this
+                  number here. A tree next door will shade you and this won't
+                  know.
+                </>
+              )}
             </li>
             <li className="mt-1.5">
               <strong className="font-medium text-white/65">

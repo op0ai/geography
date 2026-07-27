@@ -15,7 +15,8 @@ import { deviceProfile } from '../lib/device'
 import { ContextGuard, type ContextStatus } from './ContextGuard'
 import { Globe } from './Globe'
 import { GroundScene, loadGround, SCENE_RADIUS, type GroundData } from './Ground'
-import { LookControls } from './LookControls'
+import { sampleHeightLocal, unproject } from '../lib/terrain'
+import { LookControls, type LookState } from './LookControls'
 import { latLonToVec3 } from '../lib/solar'
 
 /** Camera distance (in globe radii) at which we switch to the ground scene. */
@@ -48,12 +49,18 @@ interface SceneProps {
   diving?: boolean
   onModeChange?: (mode: 'globe' | 'ground') => void
   onGroundState?: (s: GroundState) => void
-  /** where the viewer is looking in ground mode, for the on-screen compass */
-  onLook?: (s: { yaw: number; pitch: number }) => void
+  /** where the viewer is looking and standing in ground mode */
+  onLook?: (s: LookState) => void
   /** WebGL context health — drives the recovery notice */
   onContextStatus?: (s: ContextStatus) => void
   /** live coordinate under the cursor on the globe */
   onHover?: (c: { lat: number; lon: number } | null) => void
+  /**
+   * Fires as the viewer walks in ground mode, with the real-world coordinate
+   * they've reached — so the sun readings follow them rather than staying
+   * pinned to where they landed.
+   */
+  onGroundWalk?: (lat: number, lon: number) => void
 }
 
 export type GroundState =
@@ -67,6 +74,8 @@ export type GroundState =
       buildingsFailed: boolean
       /** how many building heights were guessed from storey counts */
       estimated: number
+      /** mapped trees nearby — a coverage signal, not just a count */
+      trees: number
       /** the loaded scene, so the shading engine can raytrace against it */
       data: GroundData
     }
@@ -319,6 +328,7 @@ export function Scene({
   onLook,
   onContextStatus,
   onHover,
+  onGroundWalk,
 }: SceneProps) {
   // Read once — the answer can't change mid-session, and probing creates a
   // throwaway GL context we don't want to make on every render.
@@ -377,6 +387,7 @@ export function Scene({
           empty: g.empty,
           buildingsFailed: g.buildingsFailed,
           estimated: g.buildings.filter((b) => b.estimated).length,
+          trees: g.vegetation.trees.length,
           data: g,
         })
       })
@@ -387,6 +398,42 @@ export function Scene({
     return () => ac.abort()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, ground, marker.lat, marker.lon])
+
+  /**
+   * Ground height at a local (x, z), for the walker to stand on.
+   *
+   * Heights are relative to the landing point, matching the terrain mesh the
+   * renderer builds — so "0" is the elevation where you touched down, not sea
+   * level. Returns 0 before the terrain arrives, which keeps the camera at a
+   * sane height during the descent rather than dropping it to the origin.
+   */
+  const groundAt = useMemo(() => {
+    if (!ground) return undefined
+    const { heightField, frame, originHeight } = ground
+    return (x: number, z: number) =>
+      sampleHeightLocal(heightField, frame, x, z) - originHeight
+  }, [ground])
+
+  /**
+   * Turn a walked-to scene position back into a latitude and longitude.
+   *
+   * Throttled hard: the solar maths and the shading trace both key off the
+   * coordinate, and recomputing them at 60fps while someone strolls down a
+   * street would make walking feel like wading. A quarter second is well
+   * inside the distance at which the sun's position meaningfully changes.
+   */
+  const lastWalk = useRef(0)
+  const onWalk = useMemo(() => {
+    if (!ground || !onGroundWalk) return undefined
+    const { frame } = ground
+    return (x: number, z: number) => {
+      const now = performance.now()
+      if (now - lastWalk.current < 250) return
+      lastWalk.current = now
+      const { lat, lon } = unproject(frame, x, z)
+      onGroundWalk(lat, lon)
+    }
+  }, [ground, onGroundWalk])
 
   const isGround = mode === 'ground'
 
@@ -483,6 +530,9 @@ export function Scene({
           resetKey={`${marker.lat.toFixed(3)},${marker.lon.toFixed(3)}`}
           fovRef={fovRef}
           onChange={onLook}
+          groundAt={groundAt}
+          roamRadius={SCENE_RADIUS * 0.85}
+          onMove={onWalk}
         />
       ) : (
         <OrbitControls

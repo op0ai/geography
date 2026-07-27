@@ -4,7 +4,7 @@ Guidance for AI coding agents working on **geography** — an interactive globe
 that reports what the sun is doing at any point on Earth at any moment, and
 remaps that place onto other worlds.
 
-Live: https://geography-globe.op0.workers.dev
+Live: https://opensolar.app
 Repo: https://github.com/op0ai/geography
 
 ## Setup commands
@@ -12,7 +12,7 @@ Repo: https://github.com/op0ai/geography
 ```bash
 npm install
 npm run dev        # vite dev server
-npm run verify     # 95 checks — RUN THIS BEFORE COMMITTING
+npm run verify     # 116 checks — RUN THIS BEFORE COMMITTING
 npm run build      # production build into dist/
 npx wrangler deploy
 ```
@@ -21,7 +21,7 @@ npx wrangler deploy
 
 **The astronomy is verified, not vibed. Never change `src/lib/solar.ts`,
 `src/lib/terrain.ts` or `src/lib/sunhours.ts` without running `npm run verify`
-and getting 95/95.**
+and getting 116/116.**
 
 Those three suites check against published values — solstice declinations, the
 equation-of-time extremes, London's sunrise to the minute, polar day and night
@@ -39,6 +39,7 @@ both disagreed with it. That's the bar for editing an assertion.
 ```
 src/lib/solar.ts      NOAA/Meeus solar position. Hand-rolled, no suncalc.
 src/lib/sunhours.ts   Ray-traced shading. THE headline feature — see below.
+src/lib/vegetation.ts Trees. Canopy FILTERS light, it does not block it.
 src/lib/device.ts     Texture tier + dpr, from probed GL limits.
 src/lib/planets.ts    Real obliquity/day-length/irradiance for 8 worlds + Moon.
 src/lib/terrain.ts    Web Mercator tiles + terrarium elevation decode.
@@ -87,8 +88,34 @@ that between −0.833° and 0° the sun is geometrically below the horizon but i
 light still reaches you. Marching a downward-sloping ray in that window made a
 flat, featureless plain report itself as shaded.
 
-Accuracy limits are stated in the UI, not buried: no vegetation (OSM has no
-trees), OSM heights often estimated at 3 m/storey, 700 m scene radius.
+### Vegetation: canopy filters, it does not block
+
+`src/lib/vegetation.ts`. The thing to get right, and the thing a naive
+implementation gets wrong, is that **a tree is not a wall**:
+
+| Canopy | Direct beam transmitted |
+|---|---|
+| Broadleaf in leaf | 0.05 |
+| Broadleaf bare | 0.45 |
+| Conifer, year-round | 0.10 |
+
+Konarska et al. 2014 (Göteborg, measured, five species); SOLWEIG — the standard
+urban radiation model — defaults to 0.03 leaf-on with a leaf season of DOY
+97–300. So the engine multiplies by a fraction rather than zeroing, and a
+garden under an oak has a genuinely different February from its July. Leaf
+season widens toward the equator, flips in the southern hemisphere, and is
+disabled inside the tropics.
+
+**97% of OSM trees have no height and 98% no crown**, so geometry is defaulted:
+8m/3m crown for broadleaf, 10m/2m for conifer, per open-grown urban allometry.
+OSM2World's 0.2 × height crown ratio is too narrow for street trees.
+
+**Tree coverage is a northern-European luxury** — Germany has 4.07M mapped trees
+for 84M people, India 111k for 1.4 billion. The count near a point is reported
+in the UI as a confidence signal rather than folded silently into a number.
+
+Accuracy limits are stated in the UI, not buried: estimated tree and building
+heights, 700 m scene radius, no data where OSM has none.
 
 **When the building lookup fails, the number is withheld.** A terrain-only
 result in a city is barely different from raw daylight, so showing it as a
@@ -225,7 +252,7 @@ npm run verify
 ```
 
 `scripts/verify-solar.mjs` (33), `scripts/verify-terrain.mjs` (29) and
-`scripts/verify-sunhours.mjs` (33). All transpile the TS with esbuild and run
+`scripts/verify-sunhours.mjs` (54). All transpile the TS with esbuild and run
 against independently known values.
 
 The shading suite uses geometry with arithmetic answers rather than snapshots:
@@ -250,6 +277,42 @@ Worker and per-view OG injection silently stops working.
 
 Cloudflare image resizing is **not** available on workers.dev, which is why
 `worker/png.ts` exists.
+
+## The canonical domain is opensolar.app
+
+`workers.dev` stays **enabled** and 301s to `opensolar.app` in the Worker.
+Disabling it in config would break every previously shared link, every OG card
+already cached by Slack and Twitter, and every indexed URL. The redirect runs
+first in `fetch`, before any cache lookup, so a 3xx can never be written into
+the cache under a content URL's key.
+
+**Cache keys use a fixed synthetic host** (`https://cache.internal/...`). The
+Cache API keys on the full request URL including hostname, so serving two
+hostnames would otherwise split every entry in two and orphan the whole cache
+when the old name goes away.
+
+**`stale-while-revalidate` and `stale-if-error` are NOT honoured by the Cache
+API** — documented, verified. They were removed rather than left in as
+decoration implying behaviour we don't get. `s-maxage` drives edge TTL and
+`max-age` the browser; both work as expected.
+
+The Cache API needs no configuration and works on every plan and on
+workers.dev. The widespread belief that it no-ops there is about `fetch()`'s
+`cf: { cacheEverything, cacheKey }` options, which are zone-scoped and partly
+Enterprise-gated — a different feature.
+
+## URL state, and the rate limit that bites
+
+Every view is a link, and state is mirrored with `replaceState` — never
+`pushState`, which would stack an entry per animation frame.
+
+**But the mirror is throttled to 500ms, and must stay that way.** Every engine
+rate-limits history writes far lower than you'd guess: Safari **100 per 30s and
+it THROWS**, Firefox and Chromium 200 per 10s. The play loop advances time each
+frame, so an unthrottled mirror spends Safari's entire budget in 1.7 seconds and
+then raises an uncaught SecurityError; elsewhere the address bar silently stops
+updating and shared links go stale. The Copy-link button builds its URL fresh
+from live state, so it's exact regardless.
 
 ## Deliberately not used
 
@@ -276,7 +339,7 @@ PNG decoder to replace the `document.createElement('canvas')` in `terrain.ts`
 
 ```bash
 curl -H "Accept: text/markdown" \
-  "https://geography-globe.op0.workers.dev/?at=64.1466,-21.9426"
+  "https://opensolar.app/?at=64.1466,-21.9426"
 ```
 
 Every view is addressable: `?at=LAT,LON&t=ISO8601&on=PLANET&ground=1`.

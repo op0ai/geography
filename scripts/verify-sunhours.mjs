@@ -308,6 +308,178 @@ console.log('\n=== 10. Formatting ===')
   assert('3h exactly', formatHours(3) === '3h', formatHours(3))
 }
 
+console.log('\n=== 11. Canopy filters rather than blocks ===')
+{
+  // A tree is not a wall. The whole point of the vegetation layer is that a
+  // ray through leaves still delivers light, and how much depends on season.
+  const bundle = await build({
+    entryPoints: ['src/lib/vegetation.ts'],
+    bundle: true,
+    format: 'esm',
+    platform: 'neutral',
+    outfile: join(dir, 'veg.mjs'),
+    logLevel: 'silent',
+  }).then(() => import(pathToFileURL(join(dir, 'veg.mjs')).href))
+
+  const { transmissivity, leafOn, canopyTransmission } = bundle
+
+  const JUL = new Date('2026-07-15T12:00:00Z')
+  const JAN = new Date('2026-01-15T12:00:00Z')
+
+  // Measured values: Konarska et al. 2014 puts leaf-on direct transmissivity
+  // at 0.01-0.05 and leaf-off at 0.40-0.52. SOLWEIG defaults to 0.03 leaf-on.
+  const summer = transmissivity('broadleaved', JUL, 51.5)
+  const winter = transmissivity('broadleaved', JAN, 51.5)
+  assert(
+    'broadleaf in leaf blocks almost everything',
+    summer > 0 && summer <= 0.05,
+    `${summer}`,
+  )
+  assert(
+    'bare broadleaf passes roughly half',
+    winter >= 0.4 && winter <= 0.52,
+    `${winter}`,
+  )
+  assert('season actually changes the answer', winter > summer * 5)
+
+  // Conifers barely change through the year — that's what makes them so
+  // effective at killing a low winter sun.
+  const cSummer = transmissivity('needleleaved', JUL, 51.5)
+  const cWinter = transmissivity('needleleaved', JAN, 51.5)
+  check('conifer is season-independent', cWinter, cSummer, 1e-9)
+  assert('conifer blocks heavily year round', cWinter <= 0.15, `${cWinter}`)
+
+  // Hemispheres are mirrored: July is leaf-off in Sydney.
+  assert('London is in leaf in July', leafOn(JUL, 51.5))
+  assert('London is bare in January', !leafOn(JAN, 51.5))
+  assert('Sydney is bare in July', !leafOn(JUL, -33.9))
+  assert('Sydney is in leaf in January', leafOn(JAN, -33.9))
+
+  // The tropics have no leaf-off season worth modelling.
+  assert('Singapore is evergreen in January', leafOn(JAN, 1.35))
+  assert('Singapore is evergreen in July', leafOn(JUL, 1.35))
+}
+
+console.log('\n=== 12. Canopy geometry occludes the right directions ===')
+{
+  const bundle = await import(pathToFileURL(join(dir, 'veg.mjs')).href)
+  const { canopyTransmission } = bundle
+
+  // One broadleaf, 10m tall, 4m crown radius, 15m due south.
+  const tree = {
+    x: 0,
+    z: 15,
+    height: 10,
+    crown: 4,
+    crownCentre: 7.5,
+    leaf: 'broadleaved',
+    estimated: true,
+  }
+  const veg = { trees: [tree], areas: [], tagged: 0, failed: false }
+  const eye = { x: 0, y: 1.6, z: 0 }
+  const JUL = new Date('2026-07-15T12:00:00Z')
+
+  // A ray due south at the crown's elevation must pass through it.
+  // atan((7.5 - 1.6) / 15) = 21.5 degrees.
+  const alt = (21.5 * Math.PI) / 180
+  const through = canopyTransmission(
+    veg, eye,
+    Math.sin(Math.PI) * Math.cos(alt), Math.sin(alt), -Math.cos(Math.PI) * Math.cos(alt),
+    700, JUL, 51.5,
+  )
+  assert('ray into the crown is attenuated', through < 0.1, `${through.toFixed(3)}`)
+
+  // Due north: nothing there.
+  const north = canopyTransmission(veg, eye, 0, Math.sin(alt), -Math.cos(alt), 700, JUL, 51.5)
+  check('ray away from the tree is unattenuated', north, 1, 1e-9)
+
+  // Straight up clears a 10m tree standing 15m away.
+  const up = canopyTransmission(veg, eye, 0, 1, 0, 700, JUL, 51.5)
+  check('overhead sun clears a tree beside you', up, 1, 1e-9)
+
+  // Two trees in a line compound.
+  const two = {
+    trees: [tree, { ...tree, z: 30, crown: 5 }],
+    areas: [], tagged: 0, failed: false,
+  }
+  const both = canopyTransmission(
+    two, eye,
+    Math.sin(Math.PI) * Math.cos(alt), Math.sin(alt), -Math.cos(Math.PI) * Math.cos(alt),
+    700, JUL, 51.5,
+  )
+  assert('two crowns are darker than one', both <= through, `${both} <= ${through}`)
+}
+
+console.log('\n=== 13. A garden under a tree ===')
+{
+  // The end-to-end case the feature exists for: same spot, same day-length,
+  // completely different answer in July and January because of one tree.
+  const vegMod = await import(pathToFileURL(join(dir, 'veg.mjs')).href)
+
+  // Geometry matters here, and this test got it wrong twice — instructively.
+  //
+  // First attempt: three 12m trees 10m due south, checked at London midsummer.
+  // But London's midsummer sun crosses south at 62 degrees and sails straight
+  // over a tree subtending 40.
+  //
+  // Second attempt: taller trees, same southern placement. Also wrong, for a
+  // subtler reason — at 51N in June the sun RISES at bearing 50 and SETS at
+  // 307, both well north of east and west. It spends the low-altitude hours,
+  // the only ones a 18m tree could block, in the northern half of the sky
+  // where there were no trees at all.
+  //
+  // So this is a ring: a garden enclosed by mature trees on every side, which
+  // is a real and common situation and the one where the answer is unarguable.
+  // The lesson is the same one the building tests teach — work the geometry out
+  // before running it, and when a test fails, check whether the sun actually
+  // goes where you assumed.
+  const ring = []
+  for (let a = 0; a < 360; a += 40) {
+    const rad = (a * Math.PI) / 180
+    ring.push({
+      x: Math.sin(rad) * 11,
+      z: -Math.cos(rad) * 11,
+      height: 18,
+      crown: 6,
+      crownCentre: 13.5,
+      leaf: 'broadleaved',
+      estimated: true,
+    })
+  }
+  const veg = { trees: ring, areas: [], tagged: 0, failed: false }
+
+  const withTrees = { ...flatScene(), vegetation: veg }
+  const without = flatScene()
+
+  const JUN = new Date('2026-06-21T12:00:00Z')
+  const DEC = new Date('2026-12-21T12:00:00Z')
+
+  const sJun = sunHoursForDay(withTrees, 51.5074, -0.1278, JUN, 10)
+  const bJun = sunHoursForDay(without, 51.5074, -0.1278, JUN, 10)
+  const sDec = sunHoursForDay(withTrees, 51.5074, -0.1278, DEC, 10)
+
+  assert(
+    'trees cost the garden summer sun',
+    sJun.effectiveHours < bJun.effectiveHours,
+    `${sJun.effectiveHours.toFixed(2)}h vs ${bJun.effectiveHours.toFixed(2)}h open`,
+  )
+  assert(
+    'effective hours never exceed daylight',
+    sJun.effectiveHours <= sJun.daylightHours + 1e-9 &&
+      sDec.effectiveHours <= sDec.daylightHours + 1e-9,
+  )
+  assert(
+    'dappled light is counted separately from full sun',
+    sJun.dappledHours > 0 && sJun.directHours < sJun.daylightHours,
+    `${sJun.dappledHours.toFixed(2)}h dappled`,
+  )
+  assert('the vegetation layer is reported', sJun.hadVegetation === true)
+  assert('an empty scene reports no vegetation', bJun.hadVegetation === false)
+
+  // With no vegetation the new path must reproduce the old numbers exactly.
+  check('no vegetation: effective == direct', bJun.effectiveHours, bJun.directHours, 1e-9)
+}
+
 console.log('\n==========================================================')
 console.log(`  ${pass} passed, ${fail} failed`)
 console.log('==========================================================\n')
